@@ -137,47 +137,57 @@ async def ws_proxy(websocket: WebSocket, uid: str):
     await websocket.accept()
     stats["connections"] += 1
     
-    # ساخت تارگت با احتمال وجود Query String
     target = f"ws://127.0.0.1:{XRAY_WS_PORT}/ws/{uid}"
     if websocket.url.query:
         target += f"?{websocket.url.query}"
         
+    # استخراج هدر Host برای ارسال به Xray
+    req_headers = dict(websocket.headers)
+    host = req_headers.get("host", "")
+    
     try:
-        # کانکشن به Xray
-        async with _ws.connect(target) as xray_ws:
+        # ارسال هدر Host به Xray تا کانکشن ریجکت نشود
+        ws_kwargs = {}
+        if host:
+            try:
+                ws_kwargs['additional_headers'] = {"Host": host}
+            except:
+                ws_kwargs['extra_headers'] = {"Host": host}
+                
+        xray_ws = await _ws.connect(target, **ws_kwargs)
             
-            async def c2x():
-                try:
-                    while True:
-                        # استفاده از receive به جای receive_bytes تا هم دیتای متنی و هم باینری هندل شود
-                        msg = await websocket.receive()
-                        if msg["type"] == "websocket.disconnect":
-                            break
-                        if "text" in msg:
-                            await xray_ws.send(msg["text"])
-                        elif "bytes" in msg:
-                            await xray_ws.send(msg["bytes"])
-                            stats["bytes"] += len(msg["bytes"])
-                except WebSocketDisconnect:
-                    pass
-                except Exception:
-                    pass
+        async def c2x():
+            try:
+                while True:
+                    msg = await websocket.receive()
+                    if msg["type"] == "websocket.disconnect":
+                        break
+                    if "text" in msg:
+                        await xray_ws.send(msg["text"])
+                    elif "bytes" in msg:
+                        await xray_ws.send(msg["bytes"])
+                        stats["bytes"] += len(msg["bytes"])
+            except WebSocketDisconnect:
+                pass
+            except Exception:
+                pass
 
-            async def x2c():
-                try:
-                    async for msg in xray_ws:
-                        if isinstance(msg, str):
-                            await websocket.send_text(msg)
-                        else:
-                            await websocket.send_bytes(msg)
-                            stats["bytes"] += len(msg)
-                except Exception:
-                    pass
+        async def x2c():
+            try:
+                async for msg in xray_ws:
+                    if isinstance(msg, str):
+                        await websocket.send_text(msg)
+                    else:
+                        await websocket.send_bytes(msg)
+                        stats["bytes"] += len(msg)
+            except Exception:
+                pass
 
-            t1 = asyncio.create_task(c2x())
-            t2 = asyncio.create_task(x2c())
-            await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
-            t1.cancel(); t2.cancel()
+        t1 = asyncio.create_task(c2x())
+        t2 = asyncio.create_task(x2c())
+        await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+        t1.cancel(); t2.cancel()
+        await xray_ws.close()
     except Exception as e:
         error_log.append({"e": str(e), "t": datetime.now().isoformat()})
     finally:
@@ -188,7 +198,6 @@ async def ws_proxy(websocket: WebSocket, uid: str):
 # ── Proxy XHTTP → Xray (مشکل ۱ و ۲ رفع شد) ───────────────────────────
 @app.api_route("/xh/{path:path}", methods=["GET","POST"])
 async def xhttp_proxy(path: str, request: Request):
-    # استخراج UUID از ابتدای مسیر (مثلا uuid/0 -> uuid)
     parts = path.split('/', 1)
     uid = parts[0]
     rest = parts[1] if len(parts) > 1 else ""
@@ -196,42 +205,42 @@ async def xhttp_proxy(path: str, request: Request):
     if uid not in LINKS:
         raise HTTPException(404)
         
-    # ساخت URL هدف برای Xray
     target = f"http://127.0.0.1:{XRAY_XH_PORT}/xh/{uid}"
     if rest:
         target += f"/{rest}"
+    if request.url.query:
+        target += f"?{request.url.query}"
         
-    # فیلتر کردن هدرها برای جلوگیری از تداخل پروکسی
-    headers = {k: v for k, v in request.headers.items() if k.lower() not in ['host', 'content-length', 'connection']}
+    # هدر Host باید حفظ شود تا Xray آن را قبول کند! فقط هدرهای مضر حذف می‌شوند.
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in ['content-length', 'connection', 'transfer-encoding']}
     
     if request.method == "POST":
-        # مشکل ۲: هندل صحیح درخواست‌های POST (آپلود در XHTTP)
         body = await request.body()
         stats["bytes"] += len(body)
-        
-        # حل مشکل ۱: کلاینت httpx باید در همین بلوک باز و بسته شود
         async with httpx.AsyncClient(timeout=120) as c:
             try:
                 r = await c.post(target, content=body, headers=headers)
-                # حذف هدرهای تداخل‌زا از پاسخ Xray
                 resp_headers = {k: v for k, v in r.headers.items() if k.lower() not in ['content-encoding', 'transfer-encoding', 'connection']}
                 return Response(content=r.content, status_code=r.status_code, headers=resp_headers)
             except Exception:
                 return Response(status_code=502)
     else:
-        # مشکل ۱: برای استریم، کلاینت باید داخل جنریتور ساخته شود تا تا پایان استریم زنده بماند
+        # برای GET باید استریم کنیم و کد وضعیت را از Xray بگیریم (مثلا ۲۰۰ یا ۴۰۴)
+        client = httpx.AsyncClient(timeout=120)
+        req = client.build_request("GET", target, headers=headers)
+        r = await client.send(req, stream=True)
+        
         async def gen():
-            async with httpx.AsyncClient(timeout=120) as c:
-                try:
-                    async with c.stream("GET", target, headers=headers) as r:
-                        async for chunk in r.aiter_raw():
-                            stats["bytes"] += len(chunk)
-                            yield chunk
-                except Exception:
-                    pass # در صورت بسته شدن کانکشن توسط کلاینت، خطا ندهد
-                    
-        return StreamingResponse(gen(), media_type="application/octet-stream",
-            headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
+            try:
+                async for chunk in r.aiter_raw():
+                    stats["bytes"] += len(chunk)
+                    yield chunk
+            finally:
+                await r.aclose()
+                await client.aclose()
+                
+        resp_headers = {k: v for k, v in r.headers.items() if k.lower() not in ['content-encoding', 'transfer-encoding', 'connection']}
+        return StreamingResponse(gen(), status_code=r.status_code, headers=resp_headers, media_type="application/octet-stream")
 
 # ── صفحه لاگین ───────────────────────────────────────────
 LOGIN_HTML = """<!DOCTYPE html>
