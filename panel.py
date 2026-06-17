@@ -17,8 +17,8 @@ PORT         = int(os.environ.get("PORT", 8000))
 ADMIN_PASS   = os.environ.get("ADMIN_PASSWORD", "admin1234")
 ADMIN_PATH   = os.environ.get("ADMIN_PATH", "panel").strip("/")
 PUBLIC_HOST  = os.environ.get("PUBLIC_HOST", "")
-XRAY_WS_PORT = 8080
-XRAY_XH_PORT = 8081
+XRAY_WS_PORT = 18080
+XRAY_XH_PORT = 18081
 
 PASS_HASH = hashlib.sha256(ADMIN_PASS.encode()).hexdigest()
 
