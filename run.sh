@@ -1,58 +1,12 @@
 #!/bin/sh
 
-if [ -z "$UUID" ]; then
-  UUID="90cd4a77-141a-43c9-991b-08263cfe9c10"
-fi
-
 # پنل روی پورت اصلی (Railway/Render این رو set می‌کنن)
 PANEL_PORT="${PORT:-8000}"
 
-# Xray روی پورت‌های داخلی ثابت
-XRAY_WS_PORT=18080
-XRAY_XH_PORT=18081
+# ایجاد یک کانفیگ موقت برای استارت اولیه Xray
+echo '{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"protocol":"freedom"}]}' > /app/cfg.json
 
-WS_PATH="/ws/${UUID}"
-XH_PATH="/xh/${UUID}"
-
-cat > /app/cfg.json << CFGEOF
-{
-  "log": {"loglevel": "warning"},
-  "inbounds": [
-    {
-      "port": ${XRAY_WS_PORT},
-      "listen": "127.0.0.1",
-      "protocol": "vless",
-      "settings": {
-        "clients": [{"id": "${UUID}", "level": 0}],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "ws",
-        "wsSettings": {"path": "${WS_PATH}"}
-      }
-    },
-    {
-      "port": ${XRAY_XH_PORT},
-      "listen": "127.0.0.1",
-      "protocol": "vless",
-      "settings": {
-        "clients": [{"id": "${UUID}", "level": 0}],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "xhttp",
-        "xhttpSettings": {
-          "path": "${XH_PATH}",
-          "mode": "auto"
-        }
-      }
-    }
-  ],
-  "outbounds": [{"protocol": "freedom"}]
-}
-CFGEOF
-
-echo "Starting Xray on WS:${XRAY_WS_PORT} XHTTP:${XRAY_XH_PORT}..."
+echo "Starting Xray..."
 /usr/local/bin/xray -config /app/cfg.json &
 
 # کمی صبر کن Xray بالا بیاد
