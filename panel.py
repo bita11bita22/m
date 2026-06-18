@@ -1,5 +1,5 @@
 """
-پنل مدیریت XRAY — Ultimate Edition + UI & Sub Stats Fix
+پنل مدیریت XRAY — Ultimate Edition + Memory Optimized
 """
 import os, json, uuid, asyncio, hashlib, secrets, time, subprocess, re, base64
 from datetime import datetime
@@ -57,13 +57,19 @@ active_connections = {}
 total_unique_ips = set()
 reality_keys = {"priv": "", "pub": ""}
 
+# سیستم ضد حمله (بهینه‌سازی شده برای جلوگیری از پر شدن رم)
 RATE_LIMITS = {}
+tg_client = None
 
 def log_err(msg):
     error_log.append({"e": msg, "t": datetime.now().isoformat()})
 
 def rate_limiter(ip: str, action: str, limit: int = 5, timeframe: int = 10):
     now = time.time()
+    # پاکسازی خودکار برای جلوگیری از لیک حافظه
+    if len(RATE_LIMITS) > 1000:
+        RATE_LIMITS.clear()
+        
     if ip not in RATE_LIMITS: RATE_LIMITS[ip] = {}
     if action not in RATE_LIMITS[ip]: RATE_LIMITS[ip][action] = []
     RATE_LIMITS[ip][action] = [t for t in RATE_LIMITS[ip][action] if now - t < timeframe]
@@ -252,7 +258,7 @@ async def stats_updater():
                     parts = line.strip().split()
                     if len(parts) == 2:
                         ip, b = parts[0], int(parts[1])
-                        if ip and ip != "127.0.0.1": total_unique_ips.add(ip)
+                        if ip and ip != "127.0.0.1" and len(total_unique_ips) < 100000: total_unique_ips.add(ip)
                         if b > 0: stats["bytes"] += b
         except: pass
 
@@ -271,11 +277,12 @@ async def stats_updater():
                         if ip == "127.0.0.1": active_connections[uid]["local"] = now_t
                         else:
                             active_connections[uid][ip] = now_t
-                            total_unique_ips.add(ip)
+                            if len(total_unique_ips) < 100000: total_unique_ips.add(ip)
                         user_last_active[uid] = now_t
         except: pass
 
         now = time.time()
+        # پاکسازی حافظه از کاربران غیرفعال
         for uid in list(user_last_active.keys()):
             if now - user_last_active[uid] > 60: del user_last_active[uid]
         for uid in list(active_connections.keys()):
@@ -283,6 +290,10 @@ async def stats_updater():
                 if now - active_connections[uid][ip] > 60: del active_connections[uid][ip]
             if not active_connections[uid]: del active_connections[uid]
             
+        # پاکسازی سشن‌های قدیمی لاگین
+        for t in list(SESSIONS.keys()):
+            if now > SESSIONS.get(t, 0): del SESSIONS[t]
+
         needs_restart = False
         for uid, info in LINKS.items():
             if info.get("status") != "active": continue
@@ -317,8 +328,7 @@ async def telegram_notifier():
             
             if msg and not notified:
                 try:
-                    async with httpx.AsyncClient() as client:
-                        await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id": ADMIN_CHAT_ID, "text": msg})
+                    await tg_request("sendMessage", {"chat_id": ADMIN_CHAT_ID, "text": msg})
                     LINKS[uid]["notified"] = True
                     save_links()
                 except: pass
@@ -329,6 +339,7 @@ async def telegram_notifier():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global tg_client
     load_data()
     if MASTER_UUID not in LINKS:
         LINKS[MASTER_UUID] = {"label": "Master", "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"), "sni": REALITY_SNI, "status": "active", "short_id": secrets.token_hex(4)[:7], "clean_ip": "", "ip_limit": 0}
@@ -337,11 +348,13 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(stats_updater())
     asyncio.create_task(telegram_notifier())
     
-    domain = PUBLIC_HOST or os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
-    if domain and BOT_TOKEN:
-        asyncio.create_task(set_telegram_webhook(domain))
+    if BOT_TOKEN:
+        tg_client = httpx.AsyncClient()
+        domain = PUBLIC_HOST or os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+        if domain: asyncio.create_task(set_telegram_webhook(domain))
         
     yield
+    if tg_client: await tg_client.aclose()
     if xray_process: xray_process.terminate()
 
 app = FastAPI(docs_url=None, redoc_url=None, lifespan=lifespan)
@@ -574,7 +587,6 @@ async def subscription(sid: str, request: Request):
         expiry_time = user_info.get("expiry_time", 0)
         headers = {"Subscription-Userinfo": f"upload=0; download={used_traffic}; total={data_limit if data_limit else 0}; expire={expiry_time if expiry_time else 0}"}
         
-        # ساخت کانفیگ فیک برای نمایش حجم و زمان در v2rayNG
         remaining_data = (data_limit - used_traffic) if data_limit else 0
         remaining_days = max(0, int((expiry_time - time.time()) / 86400)) if expiry_time else 0
         vol_str = fmt_bytes(remaining_data) if data_limit else "نامحدود"
@@ -650,11 +662,14 @@ bot_router = APIRouter()
 bot_state = {}
 
 async def tg_request(method: str, payload: dict):
-    if not BOT_TOKEN: return None
+    global tg_client
+    if not BOT_TOKEN or not tg_client: return None
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    async with httpx.AsyncClient() as client:
-        r = await client.post(url, json=payload)
+    try:
+        r = await tg_client.post(url, json=payload, timeout=5.0)
         return r.json()
+    except:
+        return None
 
 async def send_message(chat_id: str, text: str, reply_markup=None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
