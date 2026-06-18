@@ -2,7 +2,7 @@
 پنل مدیریت XRAY — FastAPI
 با قابلیت اضافه/حذف کاربر و ری‌استارت خودکار Xray
 """
-import os, json, uuid, asyncio, hashlib, secrets, time, subprocess, signal
+import os, json, uuid, asyncio, hashlib, secrets, time, subprocess
 from datetime import datetime
 from collections import deque
 from typing import Optional
@@ -48,6 +48,7 @@ def save_links():
         json.dump(LINKS, f)
 
 def sync_xray_config():
+    """ساخت کانفیگ Xray بر اساس کاربران فعلی و ری‌استارت آن"""
     global xray_process
     clients = [{"id": uid, "level": 0} for uid in LINKS.keys()]
     
@@ -61,7 +62,7 @@ def sync_xray_config():
                 "settings": {"clients": clients, "decryption": "none"},
                 "streamSettings": {
                     "network": "ws",
-                    "wsSettings": {"path": "/ws"}
+                    "wsSettings": {"path": "/"}  # مسیر به روت اصلی تغییر کرد
                 }
             },
             {
@@ -119,7 +120,7 @@ def get_domain(request: Request) -> str:
 def make_links(uid: str, domain: str, label: str) -> dict:
     ws   = (f"vless://{uid}@{domain}:443?"
             f"encryption=none&security=tls&type=ws"
-            f"&host={domain}&path=%2Fws"
+            f"&host={domain}&path=%2F"  # مسیر به / تغییر کرد
             f"&sni={domain}&fp=chrome#{label}-WS")
     xhttp = (f"vless://{uid}@{domain}:443?"
              f"encryption=none&security=tls&type=xhttp"
@@ -200,25 +201,20 @@ async def change_pass(request: Request, token: Optional[str] = Cookie(None)):
     PASS_HASH = hashlib.sha256(d.get("new","").encode()).hexdigest()
     return {"ok": True}
 
-# ── Proxy WS → Xray (بهینه‌سازی شده برای جلوگیری از قفل شدن) ──────────────────────────────
-@app.websocket("/ws")
+# ── Proxy WS → Xray (بهینه‌سازی شده) ──────────────────────────────
+@app.websocket("/")
 async def ws_proxy(websocket: WebSocket):
     await websocket.accept()
     stats["connections"] += 1
-    target = f"ws://127.0.0.1:{XRAY_WS_PORT}/ws"
+    
+    # اتصال مستقیم به روت اصلی Xray
+    target = f"ws://127.0.0.1:{XRAY_WS_PORT}/"
     if websocket.url.query:
         target += f"?{websocket.url.query}"
-        
-    req_headers = dict(websocket.headers)
-    host = req_headers.get("host", "")
-    ws_kwargs = {}
-    if host:
-        try: ws_kwargs['additional_headers'] = {"Host": host}
-        except: ws_kwargs['extra_headers'] = {"Host": host}
                 
     try:
-        # غیرفعال کردن زمان‌سنجی پینگ که باعث قطعی می‌شد
-        xray_ws = await _ws.connect(target, ping_interval=None, ping_timeout=None, **ws_kwargs)
+        # حذف پینگ اینتروال و هدرهای اضافی که باعث بسته شدن کانکشن توسط Xray میشد
+        xray_ws = await _ws.connect(target, ping_interval=None, ping_timeout=None)
         
         async def c2x():
             try:
