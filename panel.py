@@ -215,6 +215,4 @@ async def root(): return Response(content=b"OK", media_type="text/plain")
 async def health(): return {"status": "ok", "connections": stats["connections"]}
 
 if __name__ == "__main__":
-    import logging
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-    uvicorn.run("panel:app", host="0.0.0.0", port=PORT, reload=False, log_level="warning")
+    uvicorn.run("panel:app", host="0.0.0.0", port=PORT, reload=False)
