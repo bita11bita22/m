@@ -2,16 +2,23 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# نصب پیش‌نیازها
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl unzip gcc python3-dev nginx \
     && rm -rf /var/lib/apt/lists/*
 
+# دانلود Xray-core
 RUN curl -L -o /tmp/xray.zip \
     "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip" && \
     unzip /tmp/xray.zip -d /usr/local/bin/ && \
     rm /tmp/xray.zip && \
     chmod +x /usr/local/bin/xray
 
+# دانلود دیتابیس‌های مسیریابی (برای عبور از ترافیک ایران و بلاک تبلیغات)
+RUN curl -L -o /app/geoip.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
+RUN curl -L -o /app/geosite.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+
+# نصب پکیج‌های Python
 RUN pip install --no-cache-dir \
     fastapi \
     "uvicorn[standard]" \
