@@ -1,5 +1,5 @@
 """
-پنل مدیریت XRAY — FastAPI + Nginx + Reality + Xray Stats API (Final)
+پنل مدیریت XRAY — FastAPI + Nginx + Reality + Xray Stats API (IP Fixed)
 """
 import os, json, uuid, asyncio, hashlib, secrets, time, subprocess, re
 from datetime import datetime
@@ -146,7 +146,6 @@ def sync_xray_config():
         })
     
     cfg = {
-        # تغییر loglevel به info تا IP کاربران در لاگ ثبت شود
         "log": {"loglevel": "info", "access": XRAY_LOG},
         "stats": {},
         "policy": {
@@ -218,7 +217,7 @@ async def stats_updater():
         except:
             pass
 
-        # ۲. خواندن IPهای متصل از لاگ Xray
+        # ۲. خواندن IPهای متصل از لاگ Xray (فقط IP واقعی کاربر شمرده می‌شود)
         try:
             if os.path.exists(XRAY_LOG):
                 if os.path.getsize(XRAY_LOG) > 5 * 1024 * 1024:
@@ -228,8 +227,10 @@ async def stats_updater():
                 with open(XRAY_LOG, "r") as f:
                     f.seek(xray_log_pos); new_data = f.read(); xray_log_pos = f.tell()
                     
-                    matches = re.findall(r'(\d+\.\d+\.\d+\.\d+):\d+ accepted.*?([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', new_data, re.IGNORECASE)
+                    # الگوی اصلاح شده: فقط IP که دقیقا بعد از تاریخ و ساعت در لاگ می‌آید را می‌خواند (IPv4 و IPv6)
+                    matches = re.findall(r'^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} (\[?[0-9a-fA-F:.]+\]?):\d+ accepted.*?([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', new_data, re.IGNORECASE | re.MULTILINE)
                     for ip, uid in matches:
+                        ip = ip.strip('[]') # حذف براکت‌های IPv6
                         if uid not in active_ips: active_ips[uid] = {}
                         active_ips[uid][ip] = time.time()
                         total_unique_users.add(uid)
