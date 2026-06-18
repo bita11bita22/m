@@ -1,5 +1,5 @@
 """
-پنل مدیریت XRAY — Ultimate Edition + Telegram Bot (Crash & UI Fixed)
+پنل مدیریت XRAY — Ultimate Edition + Telegram Bot (Crash Fixed)
 """
 import os, json, uuid, asyncio, hashlib, secrets, time, subprocess, re, base64
 from datetime import datetime
@@ -169,25 +169,34 @@ def sync_xray_config():
     trojan_clients = [{"password": uid, "email": uid} for uid in active_links.keys()]
     vmess_clients = [{"id": uid, "level": 0, "email": uid, "alterId": 0} for uid in active_links.keys()]
     
-    sockopt = {"tcpFastOpen": True}
-    
     inbounds = [
-        {"port": XRAY_WS_PORT, "listen": "127.0.0.1", "protocol": "vless", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/ws"}, "sockopt": sockopt}},
-        {"port": XRAY_XH_PORT, "listen": "127.0.0.1", "protocol": "vless", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/xh", "mode": "auto"}, "sockopt": sockopt}},
-        {"port": XRAY_GRPC_PORT, "listen": "127.0.0.1", "protocol": "vless", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "grpc", "grpcSettings": {"serviceName": "grpc"}, "sockopt": sockopt}},
-        {"port": XRAY_HU_PORT, "listen": "127.0.0.1", "protocol": "vless", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "httpupgrade", "httpupgradeSettings": {"path": "/hu"}, "sockopt": sockopt}},
-        {"port": XRAY_TJ_PORT, "listen": "127.0.0.1", "protocol": "trojan", "settings": {"clients": trojan_clients}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/tj"}, "sockopt": sockopt}},
-        {"port": XRAY_VM_PORT, "listen": "127.0.0.1", "protocol": "vmess", "settings": {"clients": vmess_clients}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/vm"}, "sockopt": sockopt}},
-        {"port": XRAY_XH_INTERNAL_PORT, "listen": "127.0.0.1", "protocol": "vless", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/xh", "mode": "auto"}, "sockopt": sockopt}}
+        {"port": XRAY_WS_PORT, "listen": "127.0.0.1", "protocol": "vless", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/ws"}}},
+        {"port": XRAY_XH_PORT, "listen": "127.0.0.1", "protocol": "vless", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/xh", "mode": "auto"}}},
+        {"port": XRAY_GRPC_PORT, "listen": "127.0.0.1", "protocol": "vless", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "grpc", "grpcSettings": {"serviceName": "grpc"}}},
+        {"port": XRAY_HU_PORT, "listen": "127.0.0.1", "protocol": "vless", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "httpupgrade", "httpupgradeSettings": {"path": "/hu"}}},
+        {"port": XRAY_TJ_PORT, "listen": "127.0.0.1", "protocol": "trojan", "settings": {"clients": trojan_clients}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/tj"}}},
+        {"port": XRAY_VM_PORT, "listen": "127.0.0.1", "protocol": "vmess", "settings": {"clients": vmess_clients}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/vm"}}},
+        {"port": XRAY_XH_INTERNAL_PORT, "listen": "127.0.0.1", "protocol": "vless", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/xh", "mode": "auto"}}}
     ]
     
     if reality_keys["priv"]:
         inbounds.append({
             "port": REALITY_PORT, "listen": "0.0.0.0", "protocol": "vless",
             "settings": {"clients": reality_clients, "decryption": "none", "fallbacks": [{"dest": f"127.0.0.1:{XRAY_XH_INTERNAL_PORT}"}]},
-            "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {"show": False, "dest": f"{list(reality_snis)[0]}:443", "xver": 0, "serverNames": list(reality_snis), "privateKey": reality_keys["priv"], "shortIds": ["", "0123456789abcdef"]}, "sockopt": sockopt}
+            "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {"show": False, "dest": f"{list(reality_snis)[0]}:443", "xver": 0, "serverNames": list(reality_snis), "privateKey": reality_keys["priv"], "shortIds": ["", "0123456789abcdef"]}}
         })
     
+    # ساخت قوانین مسیریابی امن (جلوگیری از کرش در صورت نبود فایل‌های Geo)
+    routing_rules = [
+        {"type": "field", "inboundTag": ["api_in"], "outboundTag": "api_service"},
+        {"type": "field", "outboundTag": "direct", "ip": ["geoip:private"]}
+    ]
+    if os.path.exists("/app/geosite.dat"):
+        routing_rules.append({"type": "field", "outboundTag": "block", "domain": ["geosite:category-ads-all"]})
+        routing_rules.append({"type": "field", "outboundTag": "direct", "domain": ["geosite:ir"]})
+    if os.path.exists("/app/geoip.dat"):
+        routing_rules.append({"type": "field", "outboundTag": "direct", "ip": ["geoip:ir"]})
+
     cfg = {
         "log": {"loglevel": "info", "access": XRAY_LOG}, 
         "dns": {"servers": ["https://1.1.1.1/dns-query", "8.8.8.8"]},
@@ -202,12 +211,7 @@ def sync_xray_config():
         ],
         "routing": {
             "domainStrategy": "IPIfNonMatch",
-            "rules": [
-                {"type": "field", "inboundTag": ["api_in"], "outboundTag": "api_service"},
-                {"type": "field", "outboundTag": "block", "domain": ["geosite:category-ads-all"]},
-                {"type": "field", "outboundTag": "direct", "domain": ["geosite:ir"]},
-                {"type": "field", "outboundTag": "direct", "ip": ["geoip:ir", "geoip:private"]}
-            ]
+            "rules": routing_rules
         }
     }
     
