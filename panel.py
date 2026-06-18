@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 import uvicorn
 
 # ── تنظیمات ──────────────────────────────────────────────
-PORT         = 8080  # پنل روی پورت داخلی 8080 اجرا می‌شود (Nginx پورت اصلی را می‌گیرد)
+PORT         = 5000  # پنل روی پورت داخلی 5000 اجرا می‌شود (Nginx پورت اصلی را می‌گیرد)
 ADMIN_PASS   = os.environ.get("ADMIN_PASSWORD", "admin1234")
 ADMIN_PATH   = os.environ.get("ADMIN_PATH", "panel").strip("/")
 PUBLIC_HOST  = os.environ.get("PUBLIC_HOST", "")
