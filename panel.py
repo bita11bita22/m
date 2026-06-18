@@ -1,5 +1,5 @@
 """
-پنل مدیریت XRAY — Ultimate Edition + Memory Optimized
+پنل مدیریت XRAY — Ultimate Edition + CPU/RAM Optimized
 """
 import os, json, uuid, asyncio, hashlib, secrets, time, subprocess, re, base64
 from datetime import datetime
@@ -57,7 +57,6 @@ active_connections = {}
 total_unique_ips = set()
 reality_keys = {"priv": "", "pub": ""}
 
-# سیستم ضد حمله (بهینه‌سازی شده برای جلوگیری از پر شدن رم)
 RATE_LIMITS = {}
 tg_client = None
 
@@ -66,8 +65,8 @@ def log_err(msg):
 
 def rate_limiter(ip: str, action: str, limit: int = 5, timeframe: int = 10):
     now = time.time()
-    # پاکسازی خودکار برای جلوگیری از لیک حافظه
-    if len(RATE_LIMITS) > 1000:
+    # پاکسازی خودکار برای جلوگیری از پر شدن رم
+    if len(RATE_LIMITS) > 200:
         RATE_LIMITS.clear()
         
     if ip not in RATE_LIMITS: RATE_LIMITS[ip] = {}
@@ -225,11 +224,12 @@ def sync_xray_config():
 
 async def stats_updater():
     global xray_log_pos, nginx_log_pos
-    await asyncio.sleep(3)
+    await asyncio.sleep(5)
     while True:
         get_sys_info()
         if xray_process and xray_process.poll() is not None: sync_xray_config()
 
+        # ۱. خواندن ترافیک از Xray API (هر ۱۵ ثانیه)
         try:
             result = subprocess.run(["/usr/local/bin/xray", "api", "statsquery", f"--server=127.0.0.1:{XRAY_API_PORT}", "-reset"], capture_output=True, text=True, timeout=3)
             if result.stdout:
@@ -247,6 +247,7 @@ async def stats_updater():
             save_stats()
         except: pass
 
+        # ۲. خواندن ترافیک از لاگ Nginx
         try:
             if os.path.exists(NGINX_LOG):
                 if os.path.getsize(NGINX_LOG) > 1 * 1024 * 1024: open(NGINX_LOG, 'w').close(); nginx_log_pos = 0
@@ -258,10 +259,11 @@ async def stats_updater():
                     parts = line.strip().split()
                     if len(parts) == 2:
                         ip, b = parts[0], int(parts[1])
-                        if ip and ip != "127.0.0.1" and len(total_unique_ips) < 100000: total_unique_ips.add(ip)
+                        if ip and ip != "127.0.0.1" and len(total_unique_ips) < 2000: total_unique_ips.add(ip)
                         if b > 0: stats["bytes"] += b
         except: pass
 
+        # ۳. خواندن IPهای متصل (بدون Regex سنگین - جستجوی متنی سریع)
         try:
             if os.path.exists(XRAY_LOG):
                 if os.path.getsize(XRAY_LOG) > 5 * 1024 * 1024: open(XRAY_LOG, 'w').close(); xray_log_pos = 0
@@ -269,20 +271,30 @@ async def stats_updater():
                 if current_size < xray_log_pos: xray_log_pos = 0
                 with open(XRAY_LOG, "r") as f:
                     f.seek(xray_log_pos); new_data = f.read(); xray_log_pos = f.tell()
-                matches = re.findall(r'([0-9a-fA-F:.]+):\d+\s+accepted.*?email:\s*([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', new_data, re.IGNORECASE)
+                
                 now_t = time.time()
-                for ip, uid in matches:
-                    if uid in LINKS:
+                for line in new_data.splitlines():
+                    if "accepted" not in line or "email:" not in line: continue
+                    try:
+                        uid_start = line.find("email: ") + 7
+                        uid = line[uid_start:uid_start+36]
+                        if uid not in LINKS: continue
+                        
+                        ip = "127.0.0.1"
+                        if "from " in line:
+                            ip_part = line.split("from ")[1].split(":")[0]
+                            if "." in ip_part: ip = ip_part
+                            
                         if uid not in active_connections: active_connections[uid] = {}
-                        if ip == "127.0.0.1": active_connections[uid]["local"] = now_t
-                        else:
-                            active_connections[uid][ip] = now_t
-                            if len(total_unique_ips) < 100000: total_unique_ips.add(ip)
+                        active_connections[uid][ip] = now_t
                         user_last_active[uid] = now_t
+                        if ip != "127.0.0.1" and len(total_unique_ips) < 2000:
+                            total_unique_ips.add(ip)
+                    except: pass
         except: pass
 
+        # ۴. پاکسازی حافظه
         now = time.time()
-        # پاکسازی حافظه از کاربران غیرفعال
         for uid in list(user_last_active.keys()):
             if now - user_last_active[uid] > 60: del user_last_active[uid]
         for uid in list(active_connections.keys()):
@@ -290,10 +302,10 @@ async def stats_updater():
                 if now - active_connections[uid][ip] > 60: del active_connections[uid][ip]
             if not active_connections[uid]: del active_connections[uid]
             
-        # پاکسازی سشن‌های قدیمی لاگین
         for t in list(SESSIONS.keys()):
             if now > SESSIONS.get(t, 0): del SESSIONS[t]
 
+        # ۵. بررسی محدودیت دستگاه و انقضا
         needs_restart = False
         for uid, info in LINKS.items():
             if info.get("status") != "active": continue
@@ -309,7 +321,8 @@ async def stats_updater():
             
         if needs_restart: sync_xray_config()
             
-        await asyncio.sleep(5)
+        # افزایش زمان خواب از ۵ ثانیه به ۱۵ ثانیه برای کاهش فشار CPU
+        await asyncio.sleep(15)
 
 async def telegram_notifier():
     if not BOT_TOKEN or not ADMIN_CHAT_ID: return
