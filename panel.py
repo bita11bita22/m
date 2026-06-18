@@ -1,7 +1,7 @@
 """
-پنل مدیریت XRAY — FastAPI + Nginx + Reality
+پنل مدیریت XRAY — FastAPI + Nginx + Reality + Xray Stats API
 """
-import os, json, uuid, asyncio, hashlib, secrets, time, subprocess, re, sys
+import os, json, uuid, asyncio, hashlib, secrets, time, subprocess, re
 from datetime import datetime
 from collections import deque
 from typing import Optional
@@ -20,9 +20,9 @@ XRAY_XH_PORT = 18081
 MASTER_UUID  = os.environ.get("UUID", "90cd4a77-141a-43c9-991b-08263cfe9c10")
 LINKS_FILE   = "/app/links.json"
 CFG_FILE     = "/app/cfg.json"
-NGINX_LOG    = "/tmp/nginx_access.log"
 XRAY_LOG     = "/tmp/xray_access.log"
 STATS_FILE   = "/app/stats.json"
+XRAY_API_PORT = 10085  # پورت API داخلی Xray برای خواندن ترافیک
 
 # تنظیمات Reality
 REALITY_PORT = int(os.environ.get("REALITY_PORT", 18443))
@@ -38,7 +38,6 @@ LINKS: dict = {}
 error_log: deque = deque(maxlen=50)
 stats = {"bytes": 0, "start": time.time()}
 xray_process = None
-log_pos = 0
 xray_log_pos = 0
 active_ips = {}  
 total_unique_users = set()
@@ -113,9 +112,7 @@ def sync_xray_config():
     global xray_process
     generate_reality_keys()
     
-    # کلاینت‌های عادی برای WS و XHTTP
     ws_xh_clients = [{"id": uid, "level": 0, "email": uid} for uid in LINKS.keys()]
-    # کلاینت‌های Reality باید فلو Vision داشته باشند
     reality_clients = [{"id": uid, "level": 0, "email": uid, "flow": "xtls-rprx-vision"} for uid in LINKS.keys()]
     
     inbounds = [
@@ -147,8 +144,29 @@ def sync_xray_config():
     
     cfg = {
         "log": {"loglevel": "warning", "access": XRAY_LOG},
-        "inbounds": inbounds,
-        "outbounds": [{"protocol": "freedom"}]
+        "stats": {},
+        "policy": {
+            "levels": {
+                "0": {"statsUserUplink": True, "statsUserDownlink": True}
+            }
+        },
+        "api": {
+            "tag": "api",
+            "services": ["HandlerService", "LoggerService", "StatsService"]
+        },
+        "inbounds": [
+            {
+                "listen": "127.0.0.1", "port": XRAY_API_PORT, "protocol": "dokodemo-door",
+                "settings": {"address": "127.0.0.1"}, "tag": "api"
+            },
+            *inbounds
+        ],
+        "outbounds": [{"protocol": "freedom"}],
+        "routing": {
+            "rules": [
+                {"type": "field", "inboundTag": ["api"], "outboundTag": "api"}
+            ]
+        }
     }
     
     with open(CFG_FILE, "w") as f:
@@ -170,23 +188,24 @@ def sync_xray_config():
 
 # ── Stats & IP Tracker ───────────────────────────────────
 async def stats_updater():
-    global log_pos, xray_log_pos
     await asyncio.sleep(3)
     while True:
+        # ۱. خواندن ترافیک از API داخلی Xray (شامل ترافیک Reality)
         try:
-            if os.path.exists(NGINX_LOG):
-                if os.path.getsize(NGINX_LOG) > 1 * 1024 * 1024:
-                    open(NGINX_LOG, 'w').close(); log_pos = 0
-                current_size = os.path.getsize(NGINX_LOG)
-                if current_size < log_pos: log_pos = 0
-                with open(NGINX_LOG, "r") as f:
-                    f.seek(log_pos); new_data = f.read(); log_pos = f.tell()
-                    for line in new_data.splitlines():
-                        line = line.strip()
-                        if line and line.isdigit(): stats["bytes"] += int(line)
+            result = subprocess.run(
+                ["/usr/local/bin/xray", "api", "statsquery", f"--server=127.0.0.1:{XRAY_API_PORT}", "-reset"],
+                capture_output=True, text=True, timeout=3
+            )
+            out = result.stdout
+            # پیدا کردن تمام اعداد در خروجی (ترافیک آپلود و دانلود)
+            matches = re.findall(r':\s*(\d+)', out)
+            for num_str in matches:
+                stats["bytes"] += int(num_str)
             save_stats()
-        except: pass
+        except Exception as e:
+            pass
 
+        # ۲. خواندن IPهای متصل از لاگ Xray
         try:
             if os.path.exists(XRAY_LOG):
                 if os.path.getsize(XRAY_LOG) > 5 * 1024 * 1024:
@@ -195,18 +214,21 @@ async def stats_updater():
                 if current_size < xray_log_pos: xray_log_pos = 0
                 with open(XRAY_LOG, "r") as f:
                     f.seek(xray_log_pos); new_data = f.read(); xray_log_pos = f.tell()
-                    matches = re.findall(r'from\s+(\d+\.\d+\.\d+\.\d+):\d+\s+accepted.*?([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', new_data, re.IGNORECASE)
+                    
+                    # اصلاح الگوی Regex برای تطبیق با لاگ واقعی Xray
+                    matches = re.findall(r'(\d+\.\d+\.\d+\.\d+):\d+ accepted.*?([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', new_data, re.IGNORECASE)
                     for ip, uid in matches:
                         if uid not in active_ips: active_ips[uid] = {}
                         active_ips[uid][ip] = time.time()
                         total_unique_users.add(uid)
+                        
                 now = time.time()
                 for uid in list(active_ips.keys()):
                     for ip in list(active_ips[uid].keys()):
                         if now - active_ips[uid][ip] > 300: del active_ips[uid][ip]
                     if not active_ips[uid]: del active_ips[uid]
         except: pass
-        await asyncio.sleep(2)
+        await asyncio.sleep(5)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
