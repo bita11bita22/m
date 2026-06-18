@@ -1,6 +1,5 @@
 """
-پنل مدیریت XRAY — FastAPI
-بهینه شده با Nginx (فقط مدیریت کاربران)
+پنل مدیریت XRAY — FastAPI + Nginx Stats
 """
 import os, json, uuid, asyncio, hashlib, secrets, time, subprocess
 from datetime import datetime
@@ -9,10 +8,10 @@ from typing import Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response, HTTPException, Cookie
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-import uvicorn
+import httpx, uvicorn
 
 # ── تنظیمات ──────────────────────────────────────────────
-PORT         = 5000  # پنل روی پورت داخلی 5000 اجرا می‌شود (Nginx پورت اصلی را می‌گیرد)
+PORT         = 5000
 ADMIN_PASS   = os.environ.get("ADMIN_PASSWORD", "admin1234")
 ADMIN_PATH   = os.environ.get("ADMIN_PATH", "panel").strip("/")
 PUBLIC_HOST  = os.environ.get("PUBLIC_HOST", "")
@@ -21,6 +20,7 @@ XRAY_XH_PORT = 18081
 MASTER_UUID  = os.environ.get("UUID", "90cd4a77-141a-43c9-991b-08263cfe9c10")
 LINKS_FILE   = "/app/links.json"
 CFG_FILE     = "/app/cfg.json"
+NGINX_LOG    = "/tmp/nginx_access.log"
 
 PASS_HASH = hashlib.sha256(ADMIN_PASS.encode()).hexdigest()
 
@@ -30,6 +30,7 @@ LINKS: dict = {}
 error_log: deque = deque(maxlen=50)
 stats = {"connections": 0, "bytes": 0, "start": time.time()}
 xray_process = None
+log_pos = 0
 
 # ── Xray Core Manager ────────────────────────────────────
 def load_links():
@@ -90,6 +91,44 @@ def sync_xray_config():
     except Exception as e:
         error_log.append({"e": f"Xray restart failed: {e}", "t": datetime.now().isoformat()})
 
+# ── Nginx Stats Reader ───────────────────────────────────
+async def stats_updater():
+    global log_pos
+    await asyncio.sleep(3) # صبر برای بالا آمدن Nginx
+    
+    while True:
+        # ۱. خواندن اتصال‌های فعال از Nginx
+        try:
+            nginx_port = os.environ.get("PORT", "8000")
+            async with httpx.AsyncClient() as c:
+                r = await c.get(f"http://127.0.0.1:{nginx_port}/nginx_status")
+                if r.status_code == 200:
+                    lines = r.text.strip().split('\n')
+                    if len(lines) > 0 and "Active connections:" in lines[0]:
+                        stats["connections"] = int(lines[0].split(':')[1].strip())
+        except:
+            pass
+            
+        # ۲. خواندن ترافیک مصرفی از فایل لاگ Nginx
+        try:
+            if os.path.exists(NGINX_LOG):
+                current_size = os.path.getsize(NGINX_LOG)
+                if current_size < log_pos:
+                    log_pos = 0 # اگر لاگ چرخیده بود، از اول بخوان
+                
+                with open(NGINX_LOG, "r") as f:
+                    f.seek(log_pos)
+                    new_data = f.read()
+                    log_pos = f.tell()
+                    for line in new_data.splitlines():
+                        line = line.strip()
+                        if line and line.isdigit():
+                            stats["bytes"] += int(line)
+        except:
+            pass
+            
+        await asyncio.sleep(2) # آپدیت هر ۲ ثانیه
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_links()
@@ -97,6 +136,10 @@ async def lifespan(app: FastAPI):
         LINKS[MASTER_UUID] = {"label": "Master", "created_at": datetime.now().strftime("%Y-%m-%d %H:%M")}
         save_links()
     sync_xray_config()
+    
+    # استارت تسک خواندن آمار
+    asyncio.create_task(stats_updater())
+    
     yield
     if xray_process:
         xray_process.terminate()
@@ -215,4 +258,6 @@ async def root(): return Response(content=b"OK", media_type="text/plain")
 async def health(): return {"status": "ok", "connections": stats["connections"]}
 
 if __name__ == "__main__":
-    uvicorn.run("panel:app", host="0.0.0.0", port=PORT, reload=False)
+    import logging
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    uvicorn.run("panel:app", host="0.0.0.0", port=PORT, reload=False, log_level="warning")

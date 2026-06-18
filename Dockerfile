@@ -17,7 +17,8 @@ RUN curl -L -o /tmp/xray.zip \
 # نصب پکیج‌های Python
 RUN pip install --no-cache-dir \
     fastapi \
-    "uvicorn[standard]"
+    "uvicorn[standard]" \
+    httpx
 
 COPY panel.py /app/panel.py
 COPY run.sh /app/run.sh
