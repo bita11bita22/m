@@ -1,5 +1,5 @@
 """
-پنل مدیریت XRAY — FastAPI + Nginx + Reality + XHTTP Reality (Online Fixed)
+پنل مدیریت XRAY — FastAPI + Nginx + Reality + XHTTP Reality (Online Fixed v2)
 """
 import os, json, uuid, asyncio, hashlib, secrets, time, subprocess, re
 from datetime import datetime
@@ -44,7 +44,7 @@ xray_process = None
 xray_log_pos = 0
 user_traffic = {}       
 user_last_active = {}   
-active_connections = {} # uid -> { conn_id: last_seen_time }
+active_connections = {} # uid -> { ip: last_seen_time }
 total_unique_users = set()
 reality_keys = {"priv": "", "pub": ""}
 
@@ -116,7 +116,6 @@ def sync_xray_config():
         })
     
     cfg = {
-        # تغییر loglevel به info تا اتصالات در لاگ ثبت شوند
         "log": {"loglevel": "info", "access": XRAY_LOG}, 
         "stats": {},
         "policy": {"levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True}}},
@@ -165,12 +164,15 @@ async def stats_updater():
                 with open(XRAY_LOG, "r") as f:
                     f.seek(xray_log_pos); new_data = f.read(); xray_log_pos = f.tell()
                     
-                    # استخراج IP:PORT و UUID برای شمارش دقیق اتصالات (چه WS و چه Reality)
-                    matches = re.findall(r'(?:from\s+)?((?:\d{1,3}\.){3}\d{1,3}|\[?[0-9a-fA-F:]+\]?):(\d+)\s+accepted.*?email:\s*([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', new_data, re.IGNORECASE)
-                    for ip, port, uid in matches:
-                        conn_id = f"{ip}:{port}" # استفاده از IP و پورت به عنوان شناسه یکتای اتصال
+                    # الگوی اصلاح شده: تشخیص IPv4 و IPv6 (با یا بدون براکت) قبل از کلمه accepted
+                    # و استخراج دقیق UUID پس از email:
+                    matches = re.findall(r'((?:\d{1,3}\.){3}\d{1,3}|\[?[0-9a-fA-F:]+\]?):\d+\s+accepted.*?email:\s*([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', new_data, re.IGNORECASE)
+                    for ip, uid in matches:
+                        ip = ip.strip('[]') # حذف براکت‌های IPv6 اگر وجود داشت
+                        # دیگر 127.0.0.1 را فیلتر نمی‌کنیم! ترافیک Nginx هم کاربر را آنلاین می‌کند.
                         if uid not in active_connections: active_connections[uid] = {}
-                        active_connections[uid][conn_id] = time.time()
+                        # فقط IP را به عنوان کلید ذخیره می‌کنیم (نه پورت را) تا از ساخت entry های تکراری جلوگیری شود
+                        active_connections[uid][ip] = time.time()
                         user_last_active[uid] = time.time(); total_unique_users.add(uid)
         except: pass
 
@@ -178,8 +180,8 @@ async def stats_updater():
         for uid in list(user_last_active.keys()):
             if now - user_last_active[uid] > 60: del user_last_active[uid]
         for uid in list(active_connections.keys()):
-            for conn_id in list(active_connections[uid].keys()):
-                if now - active_connections[uid][conn_id] > 60: del active_connections[uid][conn_id]
+            for ip in list(active_connections[uid].keys()):
+                if now - active_connections[uid][ip] > 60: del active_connections[uid][ip]
             if not active_connections[uid]: del active_connections[uid]
         await asyncio.sleep(5)
 
@@ -246,9 +248,9 @@ async def api_links(request: Request, token: Optional[str] = Cookie(None)):
     domain = get_domain(request); out = []
     for uid, info in LINKS.items():
         is_online = uid in user_last_active
-        # شمارش تعداد اتصالات فعال برای این کاربر
-        conn_count = len(active_connections.get(uid, {}))
-        online_count = conn_count if conn_count > 0 else (1 if is_online else 0)
+        # شمارش تعداد IPهای منحصر به فرد متصل به این کاربر
+        ip_count = len(active_connections.get(uid, {}))
+        online_count = ip_count if ip_count > 0 else (1 if is_online else 0)
         out.append({"uuid": uid, "label": info["label"], "created_at": info["created_at"], "online_ips": online_count, "used_traffic": user_traffic.get(uid, 0), **make_links(uid, domain, info["label"])})
     return {"links": out}
 
