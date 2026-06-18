@@ -1,5 +1,5 @@
 """
-پنل مدیریت XRAY — Ultimate Edition + Telegram Bot
+پنل مدیریت XRAY — Ultimate Edition + Telegram Bot (Xray Crash Fixed)
 """
 import os, json, uuid, asyncio, hashlib, secrets, time, subprocess, re, base64
 from datetime import datetime
@@ -36,7 +36,6 @@ REALITY_PUBLIC_PORT = os.environ.get("REALITY_PUBLIC_PORT", "18443")
 REALITY_SNI  = os.environ.get("REALITY_SNI", "yahoo.com")
 XRAY_XH_INTERNAL_PORT = 18082
 
-# ربات تلگرام
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
 
@@ -91,6 +90,12 @@ def get_sys_info():
     except: pass
 
 # ── Xray Core Manager ────────────────────────────────────
+def check_geo_files():
+    if not os.path.exists("/app/geoip.dat"):
+        subprocess.run(["curl", "-L", "-o", "/app/geoip.dat", "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"], timeout=60)
+    if not os.path.exists("/app/geosite.dat"):
+        subprocess.run(["curl", "-L", "-o", "/app/geosite.dat", "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"], timeout=60)
+
 def load_data():
     global LINKS, total_unique_ips, reality_keys, user_traffic, stats
     try:
@@ -142,6 +147,7 @@ def generate_reality_keys():
 
 def sync_xray_config():
     global xray_process
+    check_geo_files()
     generate_reality_keys()
     
     active_links = {}
@@ -190,7 +196,7 @@ def sync_xray_config():
         "api": {"tag": "api_service", "services": ["HandlerService", "LoggerService", "StatsService"]},
         "inbounds": [{"listen": "127.0.0.1", "port": XRAY_API_PORT, "protocol": "dokodemo-door", "settings": {"address": "127.0.0.1"}, "tag": "api_in"}, *inbounds],
         "outbounds": [
-            {"protocol": "freedom", "tag": "direct", "streamSettings": {"sockopt": sockopt}},
+            {"protocol": "freedom", "tag": "direct"},
             {"protocol": "blackhole", "tag": "block"},
             {"protocol": "freedom", "tag": "api_service"}
         ],
@@ -335,7 +341,6 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(stats_updater())
     asyncio.create_task(telegram_notifier())
     
-    # تنظیم وب‌هوک ربات تلگرام
     domain = PUBLIC_HOST or os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
     if domain and BOT_TOKEN:
         asyncio.create_task(set_telegram_webhook(domain))
