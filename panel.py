@@ -1,5 +1,5 @@
 """
-پنل مدیریت XRAY — FastAPI + Nginx + Reality (Debug Mode v2)
+پنل مدیریت XRAY — FastAPI + Nginx + Reality
 """
 import os, json, uuid, asyncio, hashlib, secrets, time, subprocess, re, sys
 from datetime import datetime
@@ -24,11 +24,11 @@ NGINX_LOG    = "/tmp/nginx_access.log"
 XRAY_LOG     = "/tmp/xray_access.log"
 STATS_FILE   = "/app/stats.json"
 
-# تنظیمات Reality (هاردکد شده برای تست)
-REALITY_PORT = 18443
-REALITY_DOMAIN = "thomas.proxy.rlwy.net"
-REALITY_PUBLIC_PORT = "56975"
-REALITY_SNI  = "www.microsoft.com"
+# تنظیمات Reality
+REALITY_PORT = int(os.environ.get("REALITY_PORT", 18443))
+REALITY_DOMAIN = os.environ.get("REALITY_DOMAIN", "")
+REALITY_PUBLIC_PORT = os.environ.get("REALITY_PUBLIC_PORT", "18443")
+REALITY_SNI  = os.environ.get("REALITY_SNI", "www.microsoft.com")
 
 PASS_HASH = hashlib.sha256(ADMIN_PASS.encode()).hexdigest()
 
@@ -46,8 +46,6 @@ reality_keys = {"priv": "", "pub": ""}
 
 def log_err(msg):
     error_log.append({"e": msg, "t": datetime.now().isoformat()})
-    sys.stderr.write(f"[PANEL ERROR] {msg}\n")
-    sys.stderr.flush()
 
 # ── Xray Core Manager ────────────────────────────────────
 def load_data():
@@ -87,32 +85,30 @@ def save_stats():
 def generate_reality_keys():
     global reality_keys
     if not reality_keys["priv"]:
-        log_err("Attempting to generate Reality keys...")
         try:
             xray_path = "/usr/local/bin/xray"
-            if not os.path.exists(xray_path):
-                log_err(f"Xray binary not found at {xray_path}")
-                return
-
-            # استفاده از subprocess.run برای گرفتن دقیق خطاها
             result = subprocess.run([xray_path, "x25519"], capture_output=True, text=True, timeout=5)
-            
-            if result.returncode != 0:
-                log_err(f"Xray x25519 failed with code {result.returncode}: {result.stderr}")
-                return
-                
             out = result.stdout
-            log_err(f"Xray x25519 output: {out}")
             
-            if "Private key:" in out and "Public key:" in out:
-                reality_keys["priv"] = out.split("Private key: ")[1].split("\n")[0].strip()
-                reality_keys["pub"] = out.split("Public key: ")[1].strip()
+            # پارس کردن خروجی جدید و قدیم Xray
+            if "PrivateKey:" in out:
+                reality_keys["priv"] = out.split("PrivateKey:")[1].split("\n")[0].strip()
+            elif "Private key:" in out:
+                reality_keys["priv"] = out.split("Private key:")[1].split("\n")[0].strip()
+
+            if "Password (PublicKey):" in out:
+                reality_keys["pub"] = out.split("Password (PublicKey):")[1].split("\n")[0].strip()
+            elif "PublicKey:" in out:
+                reality_keys["pub"] = out.split("PublicKey:")[1].split("\n")[0].strip()
+            elif "Public key:" in out:
+                reality_keys["pub"] = out.split("Public key:")[1].split("\n")[0].strip()
+                
+            if reality_keys["priv"] and reality_keys["pub"]:
                 save_stats()
-                log_err(f"Reality keys generated successfully! Pub: {reality_keys['pub']}")
             else:
-                log_err("Could not parse Xray x25519 output.")
+                log_err(f"Failed to parse keys from output: {out}")
         except Exception as e:
-            log_err(f"Exception during generate_reality_keys: {str(e)}")
+            log_err(f"Failed to generate Reality keys: {str(e)}")
 
 def sync_xray_config():
     global xray_process
@@ -164,8 +160,8 @@ def sync_xray_config():
         if os.path.exists(XRAY_LOG):
             os.remove(XRAY_LOG)
             
-        log_err("Starting Xray process...")
-        xray_process = subprocess.Popen(["/usr/local/bin/xray", "-config", CFG_FILE])
+        xray_process = subprocess.Popen(["/usr/local/bin/xray", "-config", CFG_FILE], 
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
         log_err(f"Xray restart failed: {e}")
 
@@ -234,7 +230,7 @@ def make_links(uid: str, domain: str, label: str) -> dict:
     if not REALITY_DOMAIN:
         reality = "خطا: متغیر REALITY_DOMAIN در Railway ست نشده است"
     elif not reality_keys["pub"]:
-        reality = "خطا: کلیدهای Reality ساخته نشدند (برای دیدن علت به /api/debug بروید)"
+        reality = "خطا: کلیدهای Reality ساخته نشدند"
     else:
         reality = (f"vless://{uid}@{REALITY_DOMAIN}:{REALITY_PUBLIC_PORT}?"
                    f"encryption=none&security=reality&sni={REALITY_SNI}"
@@ -267,16 +263,6 @@ async def logout(token: Optional[str] = Cookie(None)):
 async def api_stats(request: Request, token: Optional[str] = Cookie(None)):
     if not auth_check(token): raise HTTPException(401)
     return {"total_users": len(LINKS), "total_connected": len(total_unique_users), "active_uuids": len(active_ips), "active_ips": sum(len(ips) for ips in active_ips.values()), "bytes": stats["bytes"], "uptime": uptime_str()}
-
-# endpoint for debugging reality keys
-@app.get("/api/debug")
-async def api_debug():
-    return {
-        "reality_keys": reality_keys,
-        "error_log": list(error_log),
-        "xray_config_exists": os.path.exists(CFG_FILE),
-        "xray_binary_exists": os.path.exists("/usr/local/bin/xray")
-    }
 
 @app.get("/api/links")
 async def api_links(request: Request, token: Optional[str] = Cookie(None)):
