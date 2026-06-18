@@ -24,10 +24,10 @@ NGINX_LOG    = "/tmp/nginx_access.log"
 XRAY_LOG     = "/tmp/xray_access.log"
 STATS_FILE   = "/app/stats.json"
 
-# تنظیمات Reality
-REALITY_PORT = int(os.environ.get("REALITY_PORT", 8443))
+# تنظیمات Reality (پورت داخلی به 18443 تغییر کرد تا تداخل نباشد)
+REALITY_PORT = int(os.environ.get("REALITY_PORT", 18443))
 REALITY_DOMAIN = os.environ.get("REALITY_DOMAIN", "")
-REALITY_PUBLIC_PORT = os.environ.get("REALITY_PUBLIC_PORT", "8443")
+REALITY_PUBLIC_PORT = os.environ.get("REALITY_PUBLIC_PORT", "18443")
 REALITY_SNI  = os.environ.get("REALITY_SNI", "www.microsoft.com")
 
 PASS_HASH = hashlib.sha256(ADMIN_PASS.encode()).hexdigest()
@@ -83,13 +83,15 @@ def generate_reality_keys():
     global reality_keys
     if not reality_keys["priv"]:
         try:
-            out = subprocess.check_output(["/usr/local/bin/xray", "x25519"], stderr=subprocess.STDOUT).decode()
-            if "Private key:" in out and "Public key:" in out:
-                reality_keys["priv"] = out.split("Private key: ")[1].split("\n")[0].strip()
-                reality_keys["pub"] = out.split("Public key: ")[1].strip()
-                save_stats()
-            else:
-                error_log.append({"e": "Xray x25519 output unexpected", "t": datetime.now().isoformat()})
+            xray_path = "/usr/local/bin/xray"
+            if os.path.exists(xray_path):
+                out = subprocess.check_output([xray_path, "x25519"], stderr=subprocess.STDOUT, timeout=5).decode()
+                if "Private key:" in out and "Public key:" in out:
+                    reality_keys["priv"] = out.split("Private key: ")[1].split("\n")[0].strip()
+                    reality_keys["pub"] = out.split("Public key: ")[1].strip()
+                    save_stats()
+                else:
+                    error_log.append({"e": f"Xray x25519 output unexpected: {out}", "t": datetime.now().isoformat()})
         except Exception as e:
             error_log.append({"e": f"Failed to generate Reality keys: {str(e)}", "t": datetime.now().isoformat()})
 
@@ -211,13 +213,16 @@ def make_links(uid: str, domain: str, label: str) -> dict:
     ws   = (f"vless://{uid}@{domain}:443?encryption=none&security=tls&type=ws&host={domain}&path=%2Fws&sni={domain}&fp=chrome#{label}-WS")
     xhttp = (f"vless://{uid}@{domain}:443?encryption=none&security=tls&type=xhttp&host={domain}&path=%2Fxh&sni={domain}&fp=chrome&mode=auto#{label}-XHTTP")
     
-    if REALITY_DOMAIN and reality_keys["pub"]:
+    # پیام‌های خطای دقیق برای کاربر
+    if not REALITY_DOMAIN:
+        reality = "خطا: متغیر REALITY_DOMAIN در Railway ست نشده است"
+    elif not reality_keys["pub"]:
+        reality = "خطا: کلیدهای Reality ساخته نشدند (منتظر ری‌استارت بمانید)"
+    else:
         reality = (f"vless://{uid}@{REALITY_DOMAIN}:{REALITY_PUBLIC_PORT}?"
                    f"encryption=none&security=reality&sni={REALITY_SNI}"
                    f"&fp=chrome&pbk={reality_keys['pub']}&sid=0123456789abcdef"
                    f"&type=tcp&flow=xtls-rprx-vision#{label}-Reality")
-    else:
-        reality = "ابتدا متغیر REALITY_DOMAIN را در Railway تنظیم کنید"
         
     return {"ws": ws, "xhttp": xhttp, "reality": reality}
 
