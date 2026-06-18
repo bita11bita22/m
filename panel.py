@@ -1,5 +1,5 @@
 """
-پنل مدیریت XRAY — Ultimate Edition + Telegram Bot (Crash Fixed)
+پنل مدیریت XRAY — Ultimate Edition + Telegram Bot (Stable & Clean)
 """
 import os, json, uuid, asyncio, hashlib, secrets, time, subprocess, re, base64
 from datetime import datetime
@@ -90,12 +90,6 @@ def get_sys_info():
     except: pass
 
 # ── Xray Core Manager ────────────────────────────────────
-def check_geo_files():
-    if not os.path.exists("/app/geoip.dat"):
-        subprocess.run(["curl", "-sL", "-o", "/app/geoip.dat", "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"], timeout=120)
-    if not os.path.exists("/app/geosite.dat"):
-        subprocess.run(["curl", "-sL", "-o", "/app/geosite.dat", "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"], timeout=120)
-
 def load_data():
     global LINKS, total_unique_ips, reality_keys, user_traffic, stats
     try:
@@ -147,7 +141,6 @@ def generate_reality_keys():
 
 def sync_xray_config():
     global xray_process
-    check_geo_files()
     generate_reality_keys()
     
     active_links = {}
@@ -186,20 +179,9 @@ def sync_xray_config():
             "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {"show": False, "dest": f"{list(reality_snis)[0]}:443", "xver": 0, "serverNames": list(reality_snis), "privateKey": reality_keys["priv"], "shortIds": ["", "0123456789abcdef"]}}
         })
     
-    # ساخت قوانین مسیریابی امن (جلوگیری از کرش در صورت نبود فایل‌های Geo)
-    routing_rules = [
-        {"type": "field", "inboundTag": ["api_in"], "outboundTag": "api_service"},
-        {"type": "field", "outboundTag": "direct", "ip": ["geoip:private"]}
-    ]
-    if os.path.exists("/app/geosite.dat"):
-        routing_rules.append({"type": "field", "outboundTag": "block", "domain": ["geosite:category-ads-all"]})
-        routing_rules.append({"type": "field", "outboundTag": "direct", "domain": ["geosite:ir"]})
-    if os.path.exists("/app/geoip.dat"):
-        routing_rules.append({"type": "field", "outboundTag": "direct", "ip": ["geoip:ir"]})
-
+    # کانفیگ ساده و پایدار Xray بدون مسیریابی‌های پیچیده
     cfg = {
         "log": {"loglevel": "info", "access": XRAY_LOG}, 
-        "dns": {"servers": ["https://1.1.1.1/dns-query", "8.8.8.8"]},
         "stats": {},
         "policy": {"levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True}}},
         "api": {"tag": "api_service", "services": ["HandlerService", "LoggerService", "StatsService"]},
@@ -210,8 +192,9 @@ def sync_xray_config():
             {"protocol": "freedom", "tag": "api_service"}
         ],
         "routing": {
-            "domainStrategy": "IPIfNonMatch",
-            "rules": routing_rules
+            "rules": [
+                {"type": "field", "inboundTag": ["api_in"], "outboundTag": "api_service"}
+            ]
         }
     }
     
