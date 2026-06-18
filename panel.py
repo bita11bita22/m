@@ -1,5 +1,5 @@
 """
-پنل مدیریت XRAY — FastAPI + Nginx + Reality
+پنل مدیریت XRAY — FastAPI + Nginx + Reality (Debug Mode)
 """
 import os, json, uuid, asyncio, hashlib, secrets, time, subprocess, re
 from datetime import datetime
@@ -24,11 +24,11 @@ NGINX_LOG    = "/tmp/nginx_access.log"
 XRAY_LOG     = "/tmp/xray_access.log"
 STATS_FILE   = "/app/stats.json"
 
-# تنظیمات Reality (پورت داخلی به 18443 تغییر کرد تا تداخل نباشد)
-REALITY_PORT = int(os.environ.get("REALITY_PORT", 18443))
-REALITY_DOMAIN = os.environ.get("REALITY_DOMAIN", "")
-REALITY_PUBLIC_PORT = os.environ.get("REALITY_PUBLIC_PORT", "18443")
-REALITY_SNI  = os.environ.get("REALITY_SNI", "www.microsoft.com")
+# تنظیمات Reality (هاردکد شده برای تست)
+REALITY_PORT = 18443
+REALITY_DOMAIN = "thomas.proxy.rlwy.net"
+REALITY_PUBLIC_PORT = "56975"
+REALITY_SNI  = "www.microsoft.com"
 
 PASS_HASH = hashlib.sha256(ADMIN_PASS.encode()).hexdigest()
 
@@ -83,16 +83,18 @@ def generate_reality_keys():
     global reality_keys
     if not reality_keys["priv"]:
         try:
-            xray_path = "/usr/local/bin/xray"
-            if os.path.exists(xray_path):
-                out = subprocess.check_output([xray_path, "x25519"], stderr=subprocess.STDOUT, timeout=5).decode()
-                if "Private key:" in out and "Public key:" in out:
-                    reality_keys["priv"] = out.split("Private key: ")[1].split("\n")[0].strip()
-                    reality_keys["pub"] = out.split("Public key: ")[1].strip()
-                    save_stats()
-                else:
-                    error_log.append({"e": f"Xray x25519 output unexpected: {out}", "t": datetime.now().isoformat()})
+            print("Attempting to generate Reality keys...")
+            out = subprocess.check_output(["/usr/local/bin/xray", "x25519"], stderr=subprocess.STDOUT, timeout=5).decode()
+            print(f"Xray x25519 output: {out}")
+            if "Private key:" in out and "Public key:" in out:
+                reality_keys["priv"] = out.split("Private key: ")[1].split("\n")[0].strip()
+                reality_keys["pub"] = out.split("Public key: ")[1].strip()
+                save_stats()
+                print(f"Reality keys generated! Pub: {reality_keys['pub']}")
+            else:
+                error_log.append({"e": f"Xray x25519 output unexpected: {out}", "t": datetime.now().isoformat()})
         except Exception as e:
+            print(f"Failed to generate Reality keys: {str(e)}")
             error_log.append({"e": f"Failed to generate Reality keys: {str(e)}", "t": datetime.now().isoformat()})
 
 def sync_xray_config():
@@ -113,7 +115,6 @@ def sync_xray_config():
         }
     ]
     
-    # اضافه کردن Reality فقط اگر کلیدها ساخته شده باشند
     if reality_keys["priv"]:
         inbounds.append({
             "port": REALITY_PORT, "listen": "0.0.0.0", "protocol": "vless",
@@ -146,9 +147,11 @@ def sync_xray_config():
         if os.path.exists(XRAY_LOG):
             os.remove(XRAY_LOG)
             
-        xray_process = subprocess.Popen(["/usr/local/bin/xray", "-config", CFG_FILE], 
-                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("Starting Xray process...")
+        # عدم سرکوب خروجی Xray برای دیدن خطاها در لاگ Railway
+        xray_process = subprocess.Popen(["/usr/local/bin/xray", "-config", CFG_FILE])
     except Exception as e:
+        print(f"Xray restart failed: {e}")
         error_log.append({"e": f"Xray restart failed: {e}", "t": datetime.now().isoformat()})
 
 # ── Stats & IP Tracker ───────────────────────────────────
@@ -213,7 +216,6 @@ def make_links(uid: str, domain: str, label: str) -> dict:
     ws   = (f"vless://{uid}@{domain}:443?encryption=none&security=tls&type=ws&host={domain}&path=%2Fws&sni={domain}&fp=chrome#{label}-WS")
     xhttp = (f"vless://{uid}@{domain}:443?encryption=none&security=tls&type=xhttp&host={domain}&path=%2Fxh&sni={domain}&fp=chrome&mode=auto#{label}-XHTTP")
     
-    # پیام‌های خطای دقیق برای کاربر
     if not REALITY_DOMAIN:
         reality = "خطا: متغیر REALITY_DOMAIN در Railway ست نشده است"
     elif not reality_keys["pub"]:
