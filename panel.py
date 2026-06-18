@@ -90,7 +90,6 @@ def generate_reality_keys():
             result = subprocess.run([xray_path, "x25519"], capture_output=True, text=True, timeout=5)
             out = result.stdout
             
-            # پارس کردن خروجی جدید و قدیم Xray
             if "PrivateKey:" in out:
                 reality_keys["priv"] = out.split("PrivateKey:")[1].split("\n")[0].strip()
             elif "Private key:" in out:
@@ -113,17 +112,21 @@ def generate_reality_keys():
 def sync_xray_config():
     global xray_process
     generate_reality_keys()
-    clients = [{"id": uid, "level": 0, "email": uid} for uid in LINKS.keys()]
+    
+    # کلاینت‌های عادی برای WS و XHTTP
+    ws_xh_clients = [{"id": uid, "level": 0, "email": uid} for uid in LINKS.keys()]
+    # کلاینت‌های Reality باید فلو Vision داشته باشند
+    reality_clients = [{"id": uid, "level": 0, "email": uid, "flow": "xtls-rprx-vision"} for uid in LINKS.keys()]
     
     inbounds = [
         {
             "port": XRAY_WS_PORT, "listen": "127.0.0.1", "protocol": "vless",
-            "settings": {"clients": clients, "decryption": "none"},
+            "settings": {"clients": ws_xh_clients, "decryption": "none"},
             "streamSettings": {"network": "ws", "wsSettings": {"path": "/ws"}}
         },
         {
             "port": XRAY_XH_PORT, "listen": "127.0.0.1", "protocol": "vless",
-            "settings": {"clients": clients, "decryption": "none"},
+            "settings": {"clients": ws_xh_clients, "decryption": "none"},
             "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/xh", "mode": "auto"}}
         }
     ]
@@ -131,7 +134,7 @@ def sync_xray_config():
     if reality_keys["priv"]:
         inbounds.append({
             "port": REALITY_PORT, "listen": "0.0.0.0", "protocol": "vless",
-            "settings": {"clients": clients, "decryption": "none"},
+            "settings": {"clients": reality_clients, "decryption": "none"},
             "streamSettings": {
                 "network": "tcp", "security": "reality",
                 "realitySettings": {
