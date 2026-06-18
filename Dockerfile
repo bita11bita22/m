@@ -2,9 +2,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# نصب curl و gcc برای ARM compatibility
+# نصب Nginx و ابزارهای لازم
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl unzip gcc python3-dev \
+    curl unzip gcc python3-dev nginx \
     && rm -rf /var/lib/apt/lists/*
 
 # دانلود Xray-core
@@ -17,12 +17,12 @@ RUN curl -L -o /tmp/xray.zip \
 # نصب پکیج‌های Python
 RUN pip install --no-cache-dir \
     fastapi \
-    "uvicorn[standard]" \
-    httpx \
-    websockets
+    "uvicorn[standard]"
 
 COPY panel.py /app/panel.py
 COPY run.sh /app/run.sh
+COPY nginx.conf /etc/nginx/nginx.conf
+
 RUN chmod +x /app/run.sh
 
 EXPOSE 8000
