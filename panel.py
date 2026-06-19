@@ -11,7 +11,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Plai
 import httpx, uvicorn
 
 # ── تنظیمات ──────────────────────────────────────────────
-PORT         = int(os.environ.get("PORT", 8000)) # پورت اصلی که Railway به آن وصل می‌شود
+PORT         = int(os.environ.get("PORT", 8000) or 8000)
 ADMIN_PASS   = os.environ.get("ADMIN_PASSWORD", "admin1234")
 ADMIN_PATH   = os.environ.get("ADMIN_PATH", "panel").strip("/")
 PUBLIC_HOST  = os.environ.get("PUBLIC_HOST", "")
@@ -46,9 +46,7 @@ active_connections = {}
 reality_keys = {"priv": "", "pub": ""}
 tg_client = None
 
-def log_err(msg): pass
-
-# ── System Info & Log Reader (بهینه شده برای CPU صفر) ────
+# ── System Info & Log Reader ─────────────────────────────
 def get_sys_info():
     global prev_cpu
     try:
@@ -74,13 +72,12 @@ def get_sys_info():
     except: pass
 
 def read_connections():
-    """خواندن سریع IPها بدون استفاده از Regex"""
     global xray_log_pos
     if not os.path.exists(XRAY_LOG): return
     try:
         curr_size = os.path.getsize(XRAY_LOG)
         if curr_size < xray_log_pos: xray_log_pos = 0
-        if curr_size > 10 * 1024 * 1024: # اگر لاگ از ۱۰ مگابایت بیشتر شد خالی شود
+        if curr_size > 10 * 1024 * 1024:
             open(XRAY_LOG, 'w').close()
             xray_log_pos = 0
             
@@ -89,12 +86,10 @@ def read_connections():
             for line in f:
                 if "accepted" not in line or "email:" not in line: continue
                 try:
-                    # استخراج سریع با split بدون Regex
                     parts = line.split()
                     ip = parts[2].split(":")[0] 
                     uid_idx = line.find("email: ") + 7
                     uid = line[uid_idx:uid_idx+36]
-                    
                     if uid in LINKS:
                         if uid not in active_connections: active_connections[uid] = {}
                         active_connections[uid][ip] = time.time()
@@ -102,7 +97,6 @@ def read_connections():
                 except: pass
             xray_log_pos = f.tell()
             
-        # پاکسازی حافظه از IPهای غیرفعال
         now = time.time()
         for uid in list(active_connections.keys()):
             for ip in list(active_connections[uid].keys()):
@@ -166,8 +160,19 @@ def sync_xray_config():
             {"listen": "127.0.0.1", "port": XRAY_API_PORT, "protocol": "dokodemo-door", "settings": {"address": "127.0.0.1"}, "tag": "api_in"},
             {
                 "port": PORT, "listen": "0.0.0.0", "protocol": "vless",
-                "settings": {"clients": clients, "decryption": "none", "fallbacks": [{"dest": f"127.0.0.1:{PANEL_PORT}"}]},
-                "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {"show": False, "dest": f"{REALITY_SNI}:443", "xver": 0, "serverNames": [REALITY_SNI], "privateKey": reality_keys["priv"], "shortIds": ["", "0123456789abcdef"]}}
+                "settings": {"clients": clients, "decryption": "none"},
+                # استفاده از dest در Reality برای فوروارد کردن ترافیک وب به پایتون
+                "streamSettings": {
+                    "network": "tcp", "security": "reality", 
+                    "realitySettings": {
+                        "show": False, 
+                        "dest": f"127.0.0.1:{PANEL_PORT}", 
+                        "xver": 0, 
+                        "serverNames": [REALITY_SNI], 
+                        "privateKey": reality_keys["priv"], 
+                        "shortIds": ["", "0123456789abcdef"]
+                    }
+                }
             }
         ],
         "outbounds": [{"protocol": "freedom", "tag": "direct"}, {"protocol": "blackhole", "tag": "block"}, {"protocol": "freedom", "tag": "api"}],
@@ -201,7 +206,7 @@ async def stats_updater():
                         if v > 0: user_last_active[p[1]] = time.time()
             save_stats()
         except: pass
-        await asyncio.sleep(30) # هر ۳۰ ثانیه یکبار برای حفظ منابع
+        await asyncio.sleep(30)
 
 async def telegram_notifier():
     if not BOT_TOKEN or not ADMIN_CHAT_ID: return
@@ -333,6 +338,10 @@ async def delete_link(uid: str, token: Optional[str] = Cookie(None)):
     if not auth_check(token): raise HTTPException(401)
     if uid == MASTER_UUID: raise HTTPException(403)
     LINKS.pop(uid, None); save_links(); sync_xray_config(); return {"ok": True}
+
+# ── Health Check (بسیار مهم برای Railway) ──────────────
+@app.get("/health")
+async def health(): return {"status": "ok"}
 
 # ── Subscription & HTML ──────────────────────────────────
 @app.get("/sub/{sid}")
