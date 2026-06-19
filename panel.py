@@ -1,5 +1,5 @@
 """
-پنل مدیریت XRAY — Ultimate Edition + WARP Config + CPU/RAM Optimized
+پنل مدیریت XRAY — Ultimate Edition + WARP Config (Crash Fixed)
 """
 import os, json, uuid, asyncio, hashlib, secrets, time, subprocess, re, base64
 from datetime import datetime
@@ -19,6 +19,7 @@ MASTER_UUID  = os.environ.get("UUID", "90cd4a77-141a-43c9-991b-08263cfe9c10")
 LINKS_FILE   = "/app/links.json"
 CFG_FILE     = "/app/cfg.json"
 XRAY_LOG     = "/tmp/xray_access.log"
+XRAY_STDERR  = "/tmp/xray_stderr.log"
 NGINX_LOG    = "/tmp/nginx_access.log"
 STATS_FILE   = "/app/stats.json"
 XRAY_API_PORT = 10085
@@ -111,11 +112,12 @@ def get_warp_config():
     try:
         with open('/app/warp_key.txt', 'r') as f:
             lines = f.readlines()
-        if len(lines) < 2: return None
+        if len(lines) < 3: return None
         secret = lines[0].strip()
-        addresses = [addr.strip() for addr in lines[1].strip().split(',')]
-        if len(addresses) < 2: addresses.append("fd01:db8:1111:2222:3333:4444:5555:6666/128")
-        return {"secret": secret, "address": addresses}
+        ipv4 = lines[1].strip()
+        ipv6 = lines[2].strip()
+        if not secret or not ipv4: return None
+        return {"secret": secret, "address": [ipv4, ipv6]}
     except: return None
 
 # ── Xray Core Manager ────────────────────────────────────
@@ -229,7 +231,7 @@ def sync_xray_config():
         outbounds.append({
             "tag": "warp_out", "protocol": "wireguard", "settings": {
                 "secret": warp_conf["secret"], "address": warp_conf["address"],
-                "peers": [{"publicKey": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=", "endpoint": "162.159.192.1:2408"}],
+                "peers": [{"publicKey": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=", "endpoint": "engage.cloudflareclient.com:2408"}],
                 "mtu": 1280
             }
         })
@@ -252,7 +254,9 @@ def sync_xray_config():
             try: xray_process.wait(timeout=2)
             except: xray_process.kill()
         if os.path.exists(XRAY_LOG): os.remove(XRAY_LOG)
-        xray_process = subprocess.Popen(["/usr/local/bin/xray", "-config", CFG_FILE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # ذخیره لاگ خطاهای Xray برای دیباگ کردن
+        err_file = open(XRAY_STDERR, "w")
+        xray_process = subprocess.Popen(["/usr/local/bin/xray", "-config", CFG_FILE], stdout=subprocess.DEVNULL, stderr=err_file)
     except: pass
 
 async def stats_updater():
@@ -468,6 +472,8 @@ async def api_logs(token: Optional[str] = Cookie(None)):
     logs = []
     if os.path.exists(XRAY_LOG):
         with open(XRAY_LOG, "r") as f: logs.extend(f.readlines()[-50:])
+    if os.path.exists(XRAY_STDERR):
+        with open(XRAY_STDERR, "r") as f: logs.extend(f.readlines()[-20:])
     return {"logs": logs}
 
 @app.get("/api/links")
