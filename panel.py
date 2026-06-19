@@ -1,5 +1,5 @@
 """
-پنل مدیریت XRAY — Ultimate Edition + WARP (Stable)
+پنل مدیریت XRAY — Ultimate Edition + WARP (Crash Fixed)
 """
 import os, json, uuid, asyncio, hashlib, secrets, time, subprocess, re, base64
 from datetime import datetime
@@ -107,7 +107,6 @@ def get_sys_info():
     except: pass
 
 def get_warp_config():
-    # خواندن امن فایل کانفیگ WARP
     if not os.path.exists('/app/warp_profile.conf'): return None
     try:
         with open('/app/warp_profile.conf', 'r') as f:
@@ -120,14 +119,17 @@ def get_warp_config():
         for line in content.splitlines():
             line = line.strip()
             if line.startswith("PrivateKey"):
-                secret = line.split(" = ")[1].strip()
+                secret = line.split("=", 1)[1].strip()
             elif line.startswith("Address"):
-                addr = line.split(" = ")[1].strip()
+                addr = line.split("=", 1)[1].strip()
                 if ":" in addr: ipv6 = addr
-                else: ipv4 = addr
+                elif not ipv4: ipv4 = addr # take first ipv4
                 
         if not secret or not ipv4: return None
-        return {"secret": secret, "address": [ipv4, ipv6]}
+        
+        addresses = [ipv4]
+        if ipv6: addresses.append(ipv6)
+        return {"secret": secret, "address": addresses}
     except: return None
 
 # ── Xray Core Manager ────────────────────────────────────
@@ -229,7 +231,7 @@ def sync_xray_config():
         {"type": "field", "inboundTag": ["api_in"], "outboundTag": "api_service"}
     ]
     
-    # اضافه کردن کانفیگ WARP
+    # اضافه کردن کانفیگ WARP (با allowedIPs صحیح برای جلوگیری از کرش)
     warp_conf = get_warp_config()
     if warp_conf:
         inbounds.append({
@@ -240,8 +242,15 @@ def sync_xray_config():
         })
         outbounds.append({
             "tag": "warp_out", "protocol": "wireguard", "settings": {
-                "secret": warp_conf["secret"], "address": warp_conf["address"],
-                "peers": [{"publicKey": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=", "endpoint": "engage.cloudflareclient.com:2408"}],
+                "secret": warp_conf["secret"], 
+                "address": warp_conf["address"],
+                "peers": [
+                    {
+                        "publicKey": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=", 
+                        "allowedIPs": ["0.0.0.0/0", "::/0"], 
+                        "endpoint": "engage.cloudflareclient.com:2408"
+                    }
+                ],
                 "mtu": 1280
             }
         })
@@ -264,7 +273,6 @@ def sync_xray_config():
             try: xray_process.wait(timeout=2)
             except: xray_process.kill()
         if os.path.exists(XRAY_LOG): os.remove(XRAY_LOG)
-        # استفاده از DEVNULL برای جلوگیری از پر شدن رم
         xray_process = subprocess.Popen(["/usr/local/bin/xray", "-config", CFG_FILE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except: pass
 
