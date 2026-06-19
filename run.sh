@@ -9,18 +9,14 @@ nginx
 sleep 1
 
 # ساخت کانفیگ Cloudflare WARP در صورت عدم وجود
-if [ ! -f /app/warp_key.txt ]; then
+if [ ! -f /app/warp_profile.conf ]; then
     echo "Registering Cloudflare WARP..."
     cd /app
     /usr/local/bin/wgcf register --accept-tos
     /usr/local/bin/wgcf generate
-    
-    # استخراج صحیح کلید خصوصی و آدرس‌های IPv4 و IPv6
-    grep 'PrivateKey' wgcf-profile.conf | awk -F' = ' '{print $2}' > /app/warp_key.txt
-    grep -m 1 'Address' wgcf-profile.conf | awk -F' = ' '{print $2}' >> /app/warp_key.txt
-    grep -m 2 'Address' wgcf-profile.conf | tail -n 1 | awk -F' = ' '{print $2}' >> /app/warp_key.txt
-    
-    rm wgcf-account.toml wgcf-profile.conf
+    # تغییر نام فایل برای استفاده در پایتون
+    mv wgcf-profile.conf /app/warp_profile.conf
+    rm -f wgcf-account.toml
 fi
 
 echo "Starting Panel..."

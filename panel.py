@@ -1,5 +1,5 @@
 """
-پنل مدیریت XRAY — Ultimate Edition + WARP Config (Crash Fixed)
+پنل مدیریت XRAY — Ultimate Edition + WARP (Stable)
 """
 import os, json, uuid, asyncio, hashlib, secrets, time, subprocess, re, base64
 from datetime import datetime
@@ -19,7 +19,6 @@ MASTER_UUID  = os.environ.get("UUID", "90cd4a77-141a-43c9-991b-08263cfe9c10")
 LINKS_FILE   = "/app/links.json"
 CFG_FILE     = "/app/cfg.json"
 XRAY_LOG     = "/tmp/xray_access.log"
-XRAY_STDERR  = "/tmp/xray_stderr.log"
 NGINX_LOG    = "/tmp/nginx_access.log"
 STATS_FILE   = "/app/stats.json"
 XRAY_API_PORT = 10085
@@ -30,7 +29,7 @@ XRAY_GRPC_PORT = 18083
 XRAY_HU_PORT   = 18084
 XRAY_TJ_PORT   = 18085
 XRAY_VM_PORT   = 18086
-XRAY_WARP_PORT = 18087  # پورت کانفیگ WARP
+XRAY_WARP_PORT = 18087
 
 REALITY_PORT = int(os.environ.get("REALITY_PORT", 18443))
 REALITY_DOMAIN = os.environ.get("REALITY_DOMAIN", "")
@@ -108,14 +107,25 @@ def get_sys_info():
     except: pass
 
 def get_warp_config():
-    if not os.path.exists('/app/warp_key.txt'): return None
+    # خواندن امن فایل کانفیگ WARP
+    if not os.path.exists('/app/warp_profile.conf'): return None
     try:
-        with open('/app/warp_key.txt', 'r') as f:
-            lines = f.readlines()
-        if len(lines) < 3: return None
-        secret = lines[0].strip()
-        ipv4 = lines[1].strip()
-        ipv6 = lines[2].strip()
+        with open('/app/warp_profile.conf', 'r') as f:
+            content = f.read()
+        
+        secret = ""
+        ipv4 = ""
+        ipv6 = ""
+        
+        for line in content.splitlines():
+            line = line.strip()
+            if line.startswith("PrivateKey"):
+                secret = line.split(" = ")[1].strip()
+            elif line.startswith("Address"):
+                addr = line.split(" = ")[1].strip()
+                if ":" in addr: ipv6 = addr
+                else: ipv4 = addr
+                
         if not secret or not ipv4: return None
         return {"secret": secret, "address": [ipv4, ipv6]}
     except: return None
@@ -254,9 +264,8 @@ def sync_xray_config():
             try: xray_process.wait(timeout=2)
             except: xray_process.kill()
         if os.path.exists(XRAY_LOG): os.remove(XRAY_LOG)
-        # ذخیره لاگ خطاهای Xray برای دیباگ کردن
-        err_file = open(XRAY_STDERR, "w")
-        xray_process = subprocess.Popen(["/usr/local/bin/xray", "-config", CFG_FILE], stdout=subprocess.DEVNULL, stderr=err_file)
+        # استفاده از DEVNULL برای جلوگیری از پر شدن رم
+        xray_process = subprocess.Popen(["/usr/local/bin/xray", "-config", CFG_FILE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except: pass
 
 async def stats_updater():
@@ -446,7 +455,7 @@ def fmt_bytes(b):
 @app.post("/api/login")
 async def login(request: Request):
     ip = request.client.host
-    if not rate_limiter(ip, "login"): raise HTTPException(429, "درخواست بیش از حد. بعداً تلاش کنید.")
+    if not rate_limiter(ip, "login"): raise HTTPException(429, "درخواست بیش از حد.")
     d = await request.json()
     if hashlib.sha256(d.get("password","").encode()).hexdigest() != PASS_HASH: raise HTTPException(403, "رمز اشتباه است")
     token = secrets.token_urlsafe(32); SESSIONS[token] = time.time() + 86400
@@ -472,8 +481,6 @@ async def api_logs(token: Optional[str] = Cookie(None)):
     logs = []
     if os.path.exists(XRAY_LOG):
         with open(XRAY_LOG, "r") as f: logs.extend(f.readlines()[-50:])
-    if os.path.exists(XRAY_STDERR):
-        with open(XRAY_STDERR, "r") as f: logs.extend(f.readlines()[-20:])
     return {"logs": logs}
 
 @app.get("/api/links")
