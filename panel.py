@@ -1,7 +1,7 @@
 """
 پنل مدیریت XRAY — Ultimate Edition + CPU/RAM Optimized
 """
-import os, json, uuid, asyncio, hashlib, secrets, time, subprocess, re, base64
+import os, json, uuid, asyncio, hashlib, secrets, time, subprocess, re, base64, ipaddress
 from datetime import datetime
 from collections import deque
 from typing import Optional
@@ -53,15 +53,34 @@ xray_log_pos = 0
 nginx_log_pos = 0
 user_traffic = {}       
 user_last_active = {}   
-active_connections = {} 
+active_connections = {}    # uid -> {ip: last_seen}   فقط Reality (ایپی واقعی مستقیم از Xray)
+protocol_connections = {}  # protocol -> {ip: last_seen}  پروتکل‌های پشت Nginx (WS/XHTTP/gRPC/...)
 total_unique_ips = set()
 reality_keys = {"priv": "", "pub": ""}
 
 RATE_LIMITS = {}
 tg_client = None
+WEBHOOK_SECRET = secrets.token_urlsafe(24)  # برای تایید اینکه درخواست واقعا از تلگرام می‌آید
+
+PROTOCOL_LABELS = {
+    "ws": "VLESS + WS + TLS", "xhttp": "VLESS + XHTTP + TLS", "grpc": "VLESS + gRPC + TLS",
+    "hu": "VLESS + HTTPUpgrade + TLS", "trojan": "Trojan + WS + TLS", "vmess": "VMess + WS + TLS",
+}
 
 def log_err(msg):
     error_log.append({"e": msg, "t": datetime.now().isoformat()})
+
+def is_public_ip(ip: str) -> bool:
+    """فقط ایپی واقعی کاربر را قبول می‌کند؛ ایپی‌های داخلی/لوکال/CGNAT (مثل 100.64.x.x که اینفرا داخلی هاست استفاده می‌کند) رد می‌شوند."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_reserved or addr.is_unspecified:
+        return False
+    if addr.version == 4 and addr in ipaddress.ip_network("100.64.0.0/10"):  # RFC 6598 - Shared/CGNAT Address Space
+        return False
+    return True
 
 def rate_limiter(ip: str, action: str, limit: int = 5, timeframe: int = 10):
     now = time.time()
@@ -247,7 +266,7 @@ async def stats_updater():
             save_stats()
         except: pass
 
-        # ۲. خواندن ترافیک از لاگ Nginx
+        # ۲. خواندن ترافیک از لاگ Nginx (و تشخیص ایپی فعال هر پروتکل: ws/xhttp/grpc/hu/trojan/vmess)
         try:
             if os.path.exists(NGINX_LOG):
                 if os.path.getsize(NGINX_LOG) > 1 * 1024 * 1024: open(NGINX_LOG, 'w').close(); nginx_log_pos = 0
@@ -255,12 +274,18 @@ async def stats_updater():
                 if current_size < nginx_log_pos: nginx_log_pos = 0
                 with open(NGINX_LOG, "r") as f:
                     f.seek(nginx_log_pos); new_data = f.read(); nginx_log_pos = f.tell()
+                now_t1 = time.time()
                 for line in new_data.splitlines():
                     parts = line.strip().split()
-                    if len(parts) == 2:
+                    if len(parts) >= 2:
                         ip, b = parts[0], int(parts[1])
-                        if ip and ip != "127.0.0.1" and len(total_unique_ips) < 2000: total_unique_ips.add(ip)
+                        proto = parts[2] if len(parts) >= 3 else None
                         if b > 0: stats["bytes"] += b
+                        if not ip or not is_public_ip(ip): continue
+                        if len(total_unique_ips) < 2000: total_unique_ips.add(ip)
+                        if proto:
+                            if proto not in protocol_connections: protocol_connections[proto] = {}
+                            protocol_connections[proto][ip] = now_t1
         except: pass
 
         # ۳. خواندن IPهای Reality از لاگ Xray
@@ -284,8 +309,8 @@ async def stats_updater():
                 )
                 for m in XRAY_RE.finditer(new_data):
                     ip, uid = m.group(1), m.group(2)
-                    # فقط Reality: IP واقعی (نه 127.0.0.1)
-                    if ip == "127.0.0.1": continue
+                    # فقط Reality: ایپی واقعی کاربر (نه 127.0.0.1 و نه ایپی‌های داخلی/CGNAT مثل 100.64.x.x)
+                    if not is_public_ip(ip): continue
                     if uid not in LINKS: continue
                     if uid not in active_connections:
                         active_connections[uid] = {}
@@ -303,6 +328,10 @@ async def stats_updater():
             for ip in list(active_connections[uid].keys()):
                 if now - active_connections[uid][ip] > 60: del active_connections[uid][ip]
             if not active_connections[uid]: del active_connections[uid]
+        for proto in list(protocol_connections.keys()):
+            for ip in list(protocol_connections[proto].keys()):
+                if now - protocol_connections[proto][ip] > 60: del protocol_connections[proto][ip]
+            if not protocol_connections[proto]: del protocol_connections[proto]
             
         for t in list(SESSIONS.keys()):
             if now > SESSIONS.get(t, 0): del SESSIONS[t]
@@ -434,6 +463,47 @@ def fmt_bytes(b):
     if b < 1024**3: return f"{b/1024**2:.2f} MB"
     return f"{b/1024**3:.2f} GB"
 
+def fmt_speed(bps):
+    return fmt_bytes(int(bps)) + "/s"
+
+def build_active_configs():
+    """
+    لیست کانفیگ‌های آنلاین را می‌سازد.
+    برای Reality دقیقاً می‌دانیم کدام کاربر با چه ایپی‌هایی وصل است.
+    برای WS/XHTTP/gRPC/HTTPUpgrade/Trojan/VMess (که پشت Nginx هستند) فقط تعداد ایپی واقعی
+    فعال هر پروتکل را از لاگ Nginx داریم؛ اگر همان لحظه فقط یک کاربر غیر-Reality آنلاین باشد
+    آن ایپی‌ها را به همان کاربر نسبت می‌دهیم، در غیر این صورت بین کاربران آنلاین مشترک نشان می‌دهیم.
+    """
+    items = []
+    reality_uids = set()
+    for uid, ips in active_connections.items():
+        if uid not in LINKS or not ips: continue
+        label = LINKS[uid].get("label", uid[:8])
+        items.append({"config": "VLESS + Reality + Vision", "label": label, "ip_count": len(ips), "attributed": True})
+        reality_uids.add(uid)
+
+    other_online = [uid for uid in user_last_active if uid in LINKS and uid not in reality_uids]
+    other_labels = [LINKS[uid].get("label", uid[:8]) for uid in other_online]
+
+    for proto, ips in protocol_connections.items():
+        if not ips or not other_online: continue
+        label = PROTOCOL_LABELS.get(proto, proto)
+        if len(other_online) == 1:
+            items.append({"config": label, "label": other_labels[0], "ip_count": len(ips), "attributed": True})
+        else:
+            items.append({"config": label, "label": " / ".join(other_labels), "ip_count": len(ips), "attributed": False})
+    return items
+
+def format_active_configs_text(items):
+    if not items: return "هیچ کانفیگ آنلاینی وجود ندارد."
+    lines = []
+    for it in items:
+        if it["attributed"]:
+            lines.append(f"🔌 کانفیگ {it['config']} کاربر {it['label']} آنلاین با {it['ip_count']} ایپی فعال که بهش وصلن")
+        else:
+            lines.append(f"🔌 کانفیگ {it['config']} — کاربران ({it['label']}) آنلاین، مجموعاً {it['ip_count']} ایپی فعال متصل")
+    return "\n".join(lines)
+
 # ── auth & api ───────────────────────────────────────────
 @app.post("/api/login")
 async def login(request: Request):
@@ -451,25 +521,20 @@ async def logout(token: Optional[str] = Cookie(None)):
 @app.get("/api/stats")
 async def api_stats(request: Request, token: Optional[str] = Cookie(None)):
     if not auth_check(token): raise HTTPException(401)
-    # لیست IP های واقعی Reality به تفکیک UUID
-    reality_ips = {}
-    for uid, ips in active_connections.items():
-        ip_list = [ip for ip in ips.keys()]
-        if ip_list:
-            reality_ips[uid] = ip_list
+    active_configs = build_active_configs()
+    total_active_ips = sum(it["ip_count"] for it in active_configs)
     return {
         "total_users": len(LINKS),
         "total_connected": len(total_unique_ips),
         "active_uuids": len(user_last_active),
-        "active_ips": sum(len(ips) for ips in active_connections.values()),
+        "active_ips": total_active_ips,
         "bytes": stats["bytes"],
         "dl_speed": stats.get("dl_speed", 0),
         "ul_speed": stats.get("ul_speed", 0),
         "uptime": uptime_str(),
         "ram": sys_info["ram"],
         "cpu": sys_info["cpu"],
-        "reality_ips": reality_ips,
-        "all_unique_ips": sorted(list(total_unique_ips)),
+        "active_configs": active_configs,
     }
 
 @app.get("/api/logs")
@@ -676,10 +741,6 @@ PANEL_HTML = r"""<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="U
 .reality-conn-count{display:inline-block;background:rgba(99,102,241,0.15);color:var(--accent);border-radius:6px;padding:2px 8px;font-size:11px;font-weight:700}
 .reality-ip-list{display:flex;flex-wrap:wrap;gap:6px}
 .reality-ip-tag{background:rgba(16,185,129,0.1);color:#065f46;border:1px solid rgba(16,185,129,0.3);border-radius:6px;padding:3px 10px;font-size:11px;font-family:monospace;direction:ltr}
-.all-ips-box{background:var(--card);border-radius:16px;padding:20px;box-shadow:0 1px 3px rgba(0,0,0,0.06);border:1px solid var(--border)}
-.all-ips-box h3{font-size:15px;font-weight:700;margin-bottom:14px;color:var(--text)}
-.all-ips-list{display:flex;flex-wrap:wrap;gap:6px;max-height:200px;overflow-y:auto}
-.ip-tag{background:rgba(99,102,241,0.08);color:var(--accent);border:1px solid rgba(99,102,241,0.2);border-radius:6px;padding:3px 10px;font-size:11px;font-family:monospace;direction:ltr}
 .mobile-header{display:none}.sidebar-bottom{margin-top:auto;padding:16px 20px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:10px}
 @media(max-width:768px){.sidebar{width:100%;min-height:auto;position:fixed;bottom:0;top:auto;flex-direction:row;padding:0;border-left:none;border-top:1px solid var(--border)}.sidebar-logo,.sidebar-bottom{display:none}.nav-item{flex-direction:column;gap:3px;padding:8px 0;flex:1;justify-content:center;font-size:10px;border-right:none!important}.nav-item.active{border-top:2px solid var(--accent);border-right:none}.main{margin-right:0;margin-bottom:65px;padding:16px;padding-top:70px}.mobile-header{display:flex;justify-content:space-between;align-items:center;padding:10px 20px;background:var(--card);border-bottom:1px solid var(--border);position:fixed;top:0;left:0;right:0;z-index:20}.mobile-header button{padding:8px 16px;background:none;border:1px solid var(--border);border-radius:10px;color:var(--muted);font-family:'Vazirmatn',sans-serif;font-size:13px;cursor:pointer}}</style></head><body>
 <div class="mobile-header"><button onclick="toggleDarkMode()" id="theme-btn-mobile">🌙</button><button onclick="logout()" style="color:var(--red); border-color:var(--red)">خروج</button></div>
@@ -690,7 +751,7 @@ PANEL_HTML = r"""<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="U
   <div class="stats-grid">
     <div class="stat-card"><div class="stat-icon">👤</div><div class="stat-val" id="s-total">—</div><div class="stat-label">کل کاربران</div></div>
     <div class="stat-card"><div class="stat-icon">🌐</div><div class="stat-val" id="s-connected">—</div><div class="stat-label">کل ایپی‌ها</div></div>
-    <div class="stat-card"><div class="stat-icon">🔥</div><div class="stat-val" id="s-online">—</div><div class="stat-label">آنلاین Reality</div></div>
+    <div class="stat-card"><div class="stat-icon">🔥</div><div class="stat-val" id="s-online">—</div><div class="stat-label">ایپی‌های فعال</div></div>
     <div class="stat-card"><div class="stat-icon">📦</div><div class="stat-val" id="s-bytes">—</div><div class="stat-label">ترافیک کل</div></div>
     <div class="stat-card speed-dl"><div class="stat-icon">⬇️</div><div class="stat-val" id="s-dl">—</div><div class="stat-label">سرعت دانلود</div></div>
     <div class="stat-card speed-ul"><div class="stat-icon">⬆️</div><div class="stat-val" id="s-ul">—</div><div class="stat-label">سرعت آپلود</div></div>
@@ -698,19 +759,11 @@ PANEL_HTML = r"""<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="U
     <div class="stat-card"><div class="stat-icon">⚙️</div><div class="stat-val" id="s-cpu">—</div><div class="stat-label">پردازنده (%)</div></div>
   </div>
 
-  <!-- باکس اتصال‌های Reality -->
+  <!-- باکس کانفیگ‌های فعال -->
   <div class="reality-box">
-    <h3>🔥 اتصال‌های فعال Reality <span id="reality-total-badge" style="font-size:12px;background:rgba(99,102,241,0.1);color:var(--accent);padding:2px 10px;border-radius:8px;font-weight:600"></span></h3>
+    <h3>🔥 کانفیگ‌های فعال <span id="reality-total-badge" style="font-size:12px;background:rgba(99,102,241,0.1);color:var(--accent);padding:2px 10px;border-radius:8px;font-weight:600"></span></h3>
     <div id="reality-connections">
       <div style="color:var(--muted);font-size:13px;text-align:center;padding:20px">در حال بارگذاری...</div>
-    </div>
-  </div>
-
-  <!-- باکس کل ایپی‌ها -->
-  <div class="all-ips-box">
-    <h3>🌐 کل ایپی‌های متصل شده <span id="all-ips-count" style="font-size:12px;background:rgba(16,185,129,0.1);color:#065f46;padding:2px 10px;border-radius:8px;font-weight:600"></span></h3>
-    <div class="all-ips-list" id="all-ips-list">
-      <div style="color:var(--muted);font-size:13px">در حال بارگذاری...</div>
     </div>
   </div>
 </div>
@@ -740,21 +793,13 @@ document.getElementById('s-ul').textContent=fmtSpeed(d.ul_speed);
 document.getElementById('s-ram').textContent=d.ram+'%';
 document.getElementById('s-cpu').textContent=d.cpu+'%';
 
-// نمایش اتصال‌های Reality
-var rIps=d.reality_ips||{};
-var keys=Object.keys(rIps);
+// نمایش کانفیگ‌های فعال (هر پروتکلی که الان کسی واقعا به آن وصل است)
+var configs=d.active_configs||[];
 var totalConn=d.active_ips||0;
-document.getElementById('reality-total-badge').textContent=totalConn+' اتصال فعال';
+document.getElementById('reality-total-badge').textContent=totalConn+' ایپی فعال';
 var rc=document.getElementById('reality-connections');
-if(keys.length===0){rc.innerHTML='<div style="color:var(--muted);font-size:13px;text-align:center;padding:20px">هیچ اتصال فعال Reality وجود ندارد</div>';}
-else{var html='';keys.forEach(function(uid){var ips=rIps[uid];var label=(allUsers[uid]&&allUsers[uid].label)||uid.substring(0,8)+'…';html+='<div class="reality-user-row">';html+='<div class="reality-user-name">🔥 '+label+' <span class="reality-conn-count">'+ips.length+' اتصال</span></div>';html+='<div class="reality-ip-list">';ips.forEach(function(ip){html+='<span class="reality-ip-tag">'+ip+'</span>';});html+='</div></div>';});rc.innerHTML=html;}
-
-// نمایش کل ایپی‌ها
-var allIps=d.all_unique_ips||[];
-document.getElementById('all-ips-count').textContent=allIps.length+' ایپی';
-var al=document.getElementById('all-ips-list');
-if(allIps.length===0){al.innerHTML='<div style="color:var(--muted);font-size:13px">هنوز ایپی ثبت نشده</div>';}
-else{al.innerHTML=allIps.map(function(ip){return'<span class="ip-tag">'+ip+'</span>';}).join('');}
+if(configs.length===0){rc.innerHTML='<div style="color:var(--muted);font-size:13px;text-align:center;padding:20px">هیچ کانفیگ آنلاینی وجود ندارد</div>';}
+else{var html='';configs.forEach(function(it){var icon=it.attributed?'🔥':'🌐';var sub=it.attributed?('کاربر '+it.label+' آنلاین'):('کاربران آنلاین: '+it.label);html+='<div class="reality-user-row">';html+='<div class="reality-user-name">'+icon+' '+it.config+' <span class="reality-conn-count">'+it.ip_count+' ایپی فعال</span></div>';html+='<div class="reality-ip-list"><span class="reality-ip-tag" style="direction:rtl">'+sub+'</span></div></div>';});rc.innerHTML=html;}
 }catch(e){}}
 function fmtBytes(b){if(b<1024)return b+'B';if(b<1024*1024)return(b/1024).toFixed(1)+'KB';if(b<1024**3)return(b/1024/1024).toFixed(2)+'MB';return(b/1024**3).toFixed(2)+'GB';}
 async function loadUsers(){try{const r=await fetch('/api/links',{credentials:'include'});if(r.status===401){location.href='__LOGIN_URL__';return}const d=await r.json();const tb=document.getElementById('users-tbody');if(!d.links.length){tb.innerHTML='<tr><td colspan="6" style="text-align:center;padding:24px">کاربری وجود ندارد</td></tr>';return;}allUsers={};tb.innerHTML=d.links.map(function(u){allUsers[u.uuid]=u;let status_badge='<span class="badge badge-blue">🟢 '+(u.online_ips>0?(u.online_ips+' اتصال'):'آنلاین')+'</span>';if(u.status==='expired')status_badge='<span class="badge badge-red">منقضی</span>';if(u.status==='blocked')status_badge='<span class="badge badge-yellow">مسدود شده</span>';let limits='';if(u.data_limit>0)limits+='<span class="badge badge-yellow">باقی‌مانده: '+fmtBytes(u.remaining_data)+'</span><br>';if(u.remaining_days>0)limits+='<span class="badge badge-yellow">'+u.remaining_days+' روز</span>';if(u.ip_limit>0)limits+='<span class="badge badge-yellow">سقف دستگاه: '+u.ip_limit+'</span>';return '<tr><td><span class="badge badge-green">'+u.label+'</span><br>'+limits+'</td><td><span style="font-size: 10px">'+u.uuid.substring(0,8)+'…</span></td><td>'+u.created_at+'</td><td>'+fmtBytes(u.used_traffic)+'</td><td>'+status_badge+'</td><td><button class="btn-sm" onclick="showLinks(\''+u.uuid+'\')">🔗 لینک</button><button class="btn-sm" onclick="extendUser(\''+u.uuid+'\')">➕ ۳۰ روز</button><button class="btn-sm" onclick="editUser(\''+u.uuid+'\')">✏️ ویرایش</button><button class="btn-sm" onclick="delUser(\''+u.uuid+'\')">حذف</button></td></tr>';}).join('');}catch(e){}}
@@ -812,91 +857,105 @@ def main_menu():
 @bot_router.post("/bot_webhook")
 async def bot_webhook(req: Request):
     if not BOT_TOKEN: return {"ok": False}
-    data = await req.json()
-    
-    if "callback_query" in data:
-        cq = data["callback_query"]
-        chat_id = cq["message"]["chat"]["id"]
-        user_id = cq["from"]["id"]
-        msg_id = cq["message"]["message_id"]
-        data_str = cq["data"]
-        
-        if str(user_id) != ADMIN_CHAT_ID: return {"ok": False}
-        await tg_request("answerCallbackQuery", {"callback_query_id": cq["id"]})
+    # تایید اینکه درخواست واقعا از سرور تلگرام می‌آید، نه یک درخواست جعلی از بیرون
+    if req.headers.get("x-telegram-bot-api-secret-token") != WEBHOOK_SECRET:
+        return {"ok": False}
+    try:
+        data = await req.json()
+    except Exception:
+        return {"ok": False}
 
-        if data_str == "menu":
-            await edit_message(chat_id, msg_id, "💡 <b>منوی مدیریت پنل XRAY</b>\nیکی از گزینه‌ها را انتخاب کنید:", main_menu())
-        elif data_str == "stats":
-            text = (
-                "📊 <b>آمار زنده سرور</b>\n\n"
-                f"👤 کل کاربران: <b>{len(LINKS)}</b>\n"
-                f"🟢 آنلاین هم‌اکنون: <b>{len(user_last_active)}</b>\n"
-                f"🌐 کل ایپی‌های وصل شده: <b>{len(total_unique_ips)}</b>\n"
-                f"📦 ترافیک کل: <b>{fmt_bytes(stats['bytes'])}</b>\n\n"
-                f"🧠 مصرف RAM: <b>{sys_info['ram']}%</b>\n"
-                f"⚙️ مصرف CPU: <b>{sys_info['cpu']}%</b>\n"
-                f"⏱️ آپتایم: <b>{uptime_str()}</b>"
-            )
-            await edit_message(chat_id, msg_id, text, main_menu())
-        elif data_str == "users":
-            if not LINKS:
-                text = "👥 <b>لیست کاربران</b>\n\nکاربری یافت نشد."
-            else:
-                text = "👥 <b>لیست کاربران (۲۰ نفر اخیر)</b>\n\n"
-                for uid, info in list(LINKS.items())[-20:]:
-                    status = "🟢" if uid in user_last_active else "⚪️"
-                    text += f"{status} <b>{info['label']}</b> | {fmt_bytes(user_traffic.get(uid, 0))}\n"
-            await edit_message(chat_id, msg_id, text, main_menu())
-        elif data_str == "new_user":
-            bot_state[chat_id] = "awaiting_name"
-            cancel_btn = {"inline_keyboard": [[{"text": "❌ انصراف", "callback_data": "menu"}]]}
-            await send_message(chat_id, "➕ <b>ساخت کاربر جدید</b>\n\nنام کاربر جدید را وارد کنید (مثلاً: علی):", cancel_btn)
+    try:
+        if "callback_query" in data:
+            cq = data["callback_query"]
+            chat_id = cq["message"]["chat"]["id"]
+            user_id = cq["from"]["id"]
+            msg_id = cq["message"]["message_id"]
+            data_str = cq["data"]
 
-    elif "message" in data:
-        msg = data["message"]
-        chat_id = msg["chat"]["id"]
-        user_id = msg["from"]["id"]
-        text = msg.get("text", "")
+            if str(user_id) != ADMIN_CHAT_ID: return {"ok": False}
+            await tg_request("answerCallbackQuery", {"callback_query_id": cq["id"]})
 
-        if str(user_id) != ADMIN_CHAT_ID: return {"ok": False}
+            if data_str == "menu":
+                await edit_message(chat_id, msg_id, "💡 <b>منوی مدیریت پنل XRAY</b>\nیکی از گزینه‌ها را انتخاب کنید:", main_menu())
+            elif data_str == "stats":
+                active_configs = build_active_configs()
+                configs_text = format_active_configs_text(active_configs)
+                text = (
+                    "📊 <b>آمار زنده سرور</b>\n\n"
+                    f"👤 کل کاربران: <b>{len(LINKS)}</b>\n"
+                    f"🟢 آنلاین هم‌اکنون: <b>{len(user_last_active)}</b>\n"
+                    f"🌐 کل ایپی‌های وصل شده: <b>{len(total_unique_ips)}</b>\n"
+                    f"📦 ترافیک کل: <b>{fmt_bytes(stats['bytes'])}</b>\n"
+                    f"⬇️ سرعت دانلود: <b>{fmt_speed(stats.get('dl_speed', 0))}</b>\n"
+                    f"⬆️ سرعت آپلود: <b>{fmt_speed(stats.get('ul_speed', 0))}</b>\n\n"
+                    f"🧠 مصرف RAM: <b>{sys_info['ram']}%</b>\n"
+                    f"⚙️ مصرف CPU: <b>{sys_info['cpu']}%</b>\n"
+                    f"⏱️ آپتایم: <b>{uptime_str()}</b>\n\n"
+                    f"🔌 <b>کانفیگ‌های آنلاین:</b>\n{configs_text}"
+                )
+                await edit_message(chat_id, msg_id, text, main_menu())
+            elif data_str == "users":
+                if not LINKS:
+                    text = "👥 <b>لیست کاربران</b>\n\nکاربری یافت نشد."
+                else:
+                    text = "👥 <b>لیست کاربران (۲۰ نفر اخیر)</b>\n\n"
+                    for uid, info in list(LINKS.items())[-20:]:
+                        status = "🟢" if uid in user_last_active else "⚪️"
+                        text += f"{status} <b>{info['label']}</b> | {fmt_bytes(user_traffic.get(uid, 0))}\n"
+                await edit_message(chat_id, msg_id, text, main_menu())
+            elif data_str == "new_user":
+                bot_state[chat_id] = "awaiting_name"
+                cancel_btn = {"inline_keyboard": [[{"text": "❌ انصراف", "callback_data": "menu"}]]}
+                await send_message(chat_id, "➕ <b>ساخت کاربر جدید</b>\n\nنام کاربر جدید را وارد کنید (مثلاً: علی):", cancel_btn)
 
-        if text == "/start":
-            bot_state.pop(chat_id, None)
-            await send_message(chat_id, "💡 <b>به ربات مدیریت پنل خوش آمدید!</b>\nیکی از گزینه‌ها را انتخاب کنید:", main_menu())
-        elif bot_state.get(chat_id) == "awaiting_name":
-            label = sanitize_label(text.strip())
-            if not label: 
-                await send_message(chat_id, "نام نمی‌تواند خالی باشد. دوباره وارد کنید:")
-                return {"ok": True}
-            
-            uid = str(uuid.uuid4())
-            short_id = secrets.token_hex(4)[:7]
-            info = {
-                "label": label, 
-                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"), 
-                "sni": REALITY_SNI, 
-                "status": "active", 
-                "short_id": short_id, 
-                "clean_ip": "", 
-                "ip_limit": 0
-            }
-            
-            LINKS[uid] = info
-            save_links()
-            sync_xray_config()
-            
-            domain = PUBLIC_HOST or "your-domain.com"
-            sub_link = f"https://{domain}/sub/{short_id}"
-            
-            bot_state.pop(chat_id, None)
-            await send_message(chat_id, f"✅ <b>کاربر با موفقیت ساخته شد!</b>\n\n👤 نام: <b>{label}</b>\n🔗 لینک ساب (برای v2rayNG):\n<code>{sub_link}</code>", main_menu())
+        elif "message" in data:
+            msg = data["message"]
+            chat_id = msg["chat"]["id"]
+            user_id = msg["from"]["id"]
+            text = msg.get("text", "")
+
+            if str(user_id) != ADMIN_CHAT_ID: return {"ok": False}
+
+            if text == "/start":
+                bot_state.pop(chat_id, None)
+                await send_message(chat_id, "💡 <b>به ربات مدیریت پنل خوش آمدید!</b>\nیکی از گزینه‌ها را انتخاب کنید:", main_menu())
+            elif bot_state.get(chat_id) == "awaiting_name":
+                label = sanitize_label(text.strip())
+                if not label:
+                    await send_message(chat_id, "نام نمی‌تواند خالی باشد. دوباره وارد کنید:")
+                    return {"ok": True}
+
+                uid = str(uuid.uuid4())
+                short_id = secrets.token_hex(4)[:7]
+                info = {
+                    "label": label,
+                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "sni": REALITY_SNI,
+                    "status": "active",
+                    "short_id": short_id,
+                    "clean_ip": "",
+                    "ip_limit": 0
+                }
+
+                LINKS[uid] = info
+                save_links()
+                sync_xray_config()
+
+                domain = PUBLIC_HOST or "your-domain.com"
+                sub_link = f"https://{domain}/sub/{short_id}"
+
+                bot_state.pop(chat_id, None)
+                await send_message(chat_id, f"✅ <b>کاربر با موفقیت ساخته شد!</b>\n\n👤 نام: <b>{label}</b>\n🔗 لینک ساب (برای v2rayNG):\n<code>{sub_link}</code>", main_menu())
+    except Exception as e:
+        log_err(f"bot_webhook: {e}")
 
     return {"ok": True}
 
 async def set_telegram_webhook(domain: str):
     if not BOT_TOKEN or not ADMIN_CHAT_ID: return
     hook_url = f"https://{domain}/bot_webhook"
-    await tg_request("setWebhook", {"url": hook_url, "allowed_updates": ["message", "callback_query"]})
+    await tg_request("setWebhook", {"url": hook_url, "secret_token": WEBHOOK_SECRET, "allowed_updates": ["message", "callback_query"]})
     await send_message(ADMIN_CHAT_ID, "🤖 <b>ربات مدیریت با موفقیت فعال شد!</b>\nپنل آماده دستورات است.", main_menu())
 
 app.include_router(bot_router)
