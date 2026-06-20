@@ -266,7 +266,10 @@ async def stats_updater():
             save_stats()
         except: pass
 
-        # ۲. خواندن ترافیک از لاگ Nginx (و تشخیص ایپی فعال هر پروتکل: ws/xhttp/grpc/hu/trojan/vmess)
+        # ۲. خواندن ترافیک از لاگ Nginx (و تشخیص ایپی واقعی فعال هر پروتکل: ws/xhttp/grpc/hu/trojan/vmess)
+        # نکته مهم: روی هاست‌هایی مثل Railway، نگینکس از طریق یک پراکسی داخلی پلتفرم به کانتینر می‌رسد،
+        # پس $remote_addr همان ایپی داخلی پلتفرم است نه ایپی واقعی کاربر؛ ایپی واقعی در هدر X-Forwarded-For می‌آید.
+        # اگر $remote_addr خودش عمومی بود (یعنی نگینکس مستقیم در معرض اینترنت است) همان قابل اعتمادتر است.
         try:
             if os.path.exists(NGINX_LOG):
                 if os.path.getsize(NGINX_LOG) > 1 * 1024 * 1024: open(NGINX_LOG, 'w').close(); nginx_log_pos = 0
@@ -276,16 +279,24 @@ async def stats_updater():
                     f.seek(nginx_log_pos); new_data = f.read(); nginx_log_pos = f.tell()
                 now_t1 = time.time()
                 for line in new_data.splitlines():
-                    parts = line.strip().split()
-                    if len(parts) >= 2:
-                        ip, b = parts[0], int(parts[1])
-                        proto = parts[2] if len(parts) >= 3 else None
-                        if b > 0: stats["bytes"] += b
-                        if not ip or not is_public_ip(ip): continue
-                        if len(total_unique_ips) < 2000: total_unique_ips.add(ip)
-                        if proto:
-                            if proto not in protocol_connections: protocol_connections[proto] = {}
-                            protocol_connections[proto][ip] = now_t1
+                    fields = line.strip().split("|")
+                    if len(fields) < 3: continue
+                    remote_addr, xff, b_str = fields[0], fields[1], fields[2]
+                    proto = fields[3] if len(fields) >= 4 else None
+                    try: b = int(b_str)
+                    except ValueError: b = 0
+                    if b > 0: stats["bytes"] += b
+
+                    real_ip = remote_addr if is_public_ip(remote_addr) else ""
+                    if not real_ip and xff:
+                        first_ip = xff.split(",")[0].strip()
+                        if is_public_ip(first_ip): real_ip = first_ip
+                    if not real_ip: continue
+
+                    if len(total_unique_ips) < 2000: total_unique_ips.add(real_ip)
+                    if proto:
+                        if proto not in protocol_connections: protocol_connections[proto] = {}
+                        protocol_connections[proto][real_ip] = now_t1
         except: pass
 
         # ۳. خواندن IPهای Reality از لاگ Xray
