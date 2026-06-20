@@ -54,7 +54,8 @@ nginx_log_pos = 0
 user_traffic = {}       
 user_last_active = {}   
 active_connections = {}    # uid -> {ip: last_seen}   فقط Reality (ایپی واقعی مستقیم از Xray)
-protocol_connections = {}  # protocol -> {ip: last_seen}  پروتکل‌های پشت Nginx (WS/XHTTP/gRPC/...)
+protocol_connections = {}  # protocol -> {ip: last_seen}  بهترین تخمین ایپی واقعی هر پروتکل از لاگ Nginx
+inbound_last_active = {}   # tag -> last_seen   آیا همین الان ترافیک از این inbound رد شده (مستقل از تشخیص ایپی)
 total_unique_ips = set()
 reality_keys = {"priv": "", "pub": ""}
 
@@ -66,6 +67,12 @@ PROTOCOL_LABELS = {
     "ws": "VLESS + WS + TLS", "xhttp": "VLESS + XHTTP + TLS", "grpc": "VLESS + gRPC + TLS",
     "hu": "VLESS + HTTPUpgrade + TLS", "trojan": "Trojan + WS + TLS", "vmess": "VMess + WS + TLS",
 }
+# تگ inbound در کانفیگ Xray -> نام پروتکل (برای تشخیص آنلاین بودن هر کانفیگ از روی شمارنده‌های داخلی خود Xray)
+TAG_TO_PROTO = {
+    "ws-in": "ws", "xhttp-in": "xhttp", "grpc-in": "grpc",
+    "hu-in": "hu", "trojan-in": "trojan", "vmess-in": "vmess",
+}
+CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")  # RFC 6598 - Shared/CGNAT Address Space (یک‌بار ساخته می‌شود، نه هر بار)
 
 def log_err(msg):
     error_log.append({"e": msg, "t": datetime.now().isoformat()})
@@ -78,7 +85,7 @@ def is_public_ip(ip: str) -> bool:
         return False
     if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_reserved or addr.is_unspecified:
         return False
-    if addr.version == 4 and addr in ipaddress.ip_network("100.64.0.0/10"):  # RFC 6598 - Shared/CGNAT Address Space
+    if addr.version == 4 and addr in CGNAT_NET:
         return False
     return True
 
@@ -201,18 +208,18 @@ def sync_xray_config():
     vmess_clients = [{"id": uid, "level": 0, "email": uid, "alterId": 0} for uid in active_links.keys()]
     
     inbounds = [
-        {"port": XRAY_WS_PORT, "listen": "127.0.0.1", "protocol": "vless", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/ws"}}},
-        {"port": XRAY_XH_PORT, "listen": "127.0.0.1", "protocol": "vless", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/xh", "mode": "auto"}}},
-        {"port": XRAY_GRPC_PORT, "listen": "127.0.0.1", "protocol": "vless", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "grpc", "grpcSettings": {"serviceName": "grpc"}}},
-        {"port": XRAY_HU_PORT, "listen": "127.0.0.1", "protocol": "vless", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "httpupgrade", "httpupgradeSettings": {"path": "/hu"}}},
-        {"port": XRAY_TJ_PORT, "listen": "127.0.0.1", "protocol": "trojan", "settings": {"clients": trojan_clients}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/tj"}}},
-        {"port": XRAY_VM_PORT, "listen": "127.0.0.1", "protocol": "vmess", "settings": {"clients": vmess_clients}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/vm"}}},
-        {"port": XRAY_XH_INTERNAL_PORT, "listen": "127.0.0.1", "protocol": "vless", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/xh", "mode": "auto"}}}
+        {"port": XRAY_WS_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "ws-in", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/ws"}}},
+        {"port": XRAY_XH_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "xhttp-in", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/xh", "mode": "auto"}}},
+        {"port": XRAY_GRPC_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "grpc-in", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "grpc", "grpcSettings": {"serviceName": "grpc"}}},
+        {"port": XRAY_HU_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "hu-in", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "httpupgrade", "httpupgradeSettings": {"path": "/hu"}}},
+        {"port": XRAY_TJ_PORT, "listen": "127.0.0.1", "protocol": "trojan", "tag": "trojan-in", "settings": {"clients": trojan_clients}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/tj"}}},
+        {"port": XRAY_VM_PORT, "listen": "127.0.0.1", "protocol": "vmess", "tag": "vmess-in", "settings": {"clients": vmess_clients}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/vm"}}},
+        {"port": XRAY_XH_INTERNAL_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "xhttp-internal-in", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/xh", "mode": "auto"}}}
     ]
     
     if reality_keys["priv"]:
         inbounds.append({
-            "port": REALITY_PORT, "listen": "0.0.0.0", "protocol": "vless",
+            "port": REALITY_PORT, "listen": "0.0.0.0", "protocol": "vless", "tag": "reality-in",
             "settings": {"clients": reality_clients, "decryption": "none", "fallbacks": [{"dest": f"127.0.0.1:{XRAY_XH_INTERNAL_PORT}"}]},
             "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {"show": False, "dest": f"{list(reality_snis)[0]}:443", "xver": 0, "serverNames": list(reality_snis), "privateKey": reality_keys["priv"], "shortIds": ["", "0123456789abcdef"]}}
         })
@@ -220,7 +227,10 @@ def sync_xray_config():
     cfg = {
         "log": {"loglevel": "info", "access": XRAY_LOG}, 
         "stats": {},
-        "policy": {"levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True}}},
+        "policy": {
+            "levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True}},
+            "system": {"statsInboundUplink": True, "statsInboundDownlink": True}
+        },
         "api": {"tag": "api_service", "services": ["HandlerService", "LoggerService", "StatsService"]},
         "inbounds": [{"listen": "127.0.0.1", "port": XRAY_API_PORT, "protocol": "dokodemo-door", "settings": {"address": "127.0.0.1"}, "tag": "api_in"}, *inbounds],
         "outbounds": [
@@ -263,6 +273,11 @@ async def stats_updater():
                         user_traffic[uid] += value
                         stats["bytes"] += value
                         if value > 0: user_last_active[uid] = time.time()
+                    elif len(parts) == 4 and parts[0] == "inbound" and parts[2] == "traffic":
+                        # این شمارنده مستقیماً از خود Xray می‌آید، پس بدون توجه به اینکه Nginx ایپی واقعی
+                        # کاربر را نشان می‌دهد یا نه، دقیقاً می‌فهمیم همین الان از کدام پروتکل ترافیک رد شده.
+                        tag = parts[1]
+                        if value > 0: inbound_last_active[tag] = time.time()
             save_stats()
         except: pass
 
@@ -480,10 +495,11 @@ def fmt_speed(bps):
 def build_active_configs():
     """
     لیست کانفیگ‌های آنلاین را می‌سازد.
-    برای Reality دقیقاً می‌دانیم کدام کاربر با چه ایپی‌هایی وصل است.
-    برای WS/XHTTP/gRPC/HTTPUpgrade/Trojan/VMess (که پشت Nginx هستند) فقط تعداد ایپی واقعی
-    فعال هر پروتکل را از لاگ Nginx داریم؛ اگر همان لحظه فقط یک کاربر غیر-Reality آنلاین باشد
-    آن ایپی‌ها را به همان کاربر نسبت می‌دهیم، در غیر این صورت بین کاربران آنلاین مشترک نشان می‌دهیم.
+    برای Reality دقیقاً می‌دانیم کدام کاربر با چه ایپی‌هایی وصل است (مستقیم از لاگ Xray).
+    برای WS/XHTTP/gRPC/HTTPUpgrade/Trojan/VMess (که پشت Nginx هستند)، "آنلاین بودن" را از
+    شمارنده ترافیک خود inbound در Xray می‌فهمیم (inbound_last_active) که کاملاً مستقل از اینکه
+    Nginx/هاست ایپی واقعی کاربر را نشان بدهد یا نه کار می‌کند. تعداد ایپی را اگر از لاگ Nginx
+    داشته باشیم دقیق نشان می‌دهیم، وگرنه تعداد کاربران آنلاین همان لحظه را به‌عنوان تخمین می‌گذاریم.
     """
     items = []
     reality_uids = set()
@@ -496,13 +512,17 @@ def build_active_configs():
     other_online = [uid for uid in user_last_active if uid in LINKS and uid not in reality_uids]
     other_labels = [LINKS[uid].get("label", uid[:8]) for uid in other_online]
 
-    for proto, ips in protocol_connections.items():
-        if not ips or not other_online: continue
+    now = time.time()
+    active_protocols = [proto for tag, proto in TAG_TO_PROTO.items() if now - inbound_last_active.get(tag, 0) < 30]
+
+    for proto in active_protocols:
+        if not other_online: continue
         label = PROTOCOL_LABELS.get(proto, proto)
+        ip_count = len(protocol_connections.get(proto, {})) or len(other_online)
         if len(other_online) == 1:
-            items.append({"config": label, "label": other_labels[0], "ip_count": len(ips), "attributed": True})
+            items.append({"config": label, "label": other_labels[0], "ip_count": ip_count, "attributed": True})
         else:
-            items.append({"config": label, "label": " / ".join(other_labels), "ip_count": len(ips), "attributed": False})
+            items.append({"config": label, "label": " / ".join(other_labels), "ip_count": ip_count, "attributed": False})
     return items
 
 def format_active_configs_text(items):
